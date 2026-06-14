@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -179,6 +180,7 @@ func (ml *memberList) agingSuspects(timeout time.Duration) []string {
 			out = append(out, id)
 		}
 	}
+	sort.Strings(out)
 	return out
 }
 
@@ -201,6 +203,9 @@ func (ml *memberList) randomUpdates(n int, perm func(int) []int, exclude map[str
 	if len(all) == 0 {
 		return nil
 	}
+	// Sort before applying the seeded permutation so the random choice is itself
+	// deterministic (map order is not).
+	sort.Slice(all, func(i, j int) bool { return all[i].ID < all[j].ID })
 	order := perm(len(all))
 	out := make([]Update, 0, n)
 	for _, i := range order {
@@ -221,6 +226,7 @@ func (ml *memberList) snapshot() []Member {
 	for _, m := range ml.members {
 		out = append(out, *m)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
@@ -246,5 +252,6 @@ func (ml *memberList) aliveOthers(exclude string) []Member {
 		}
 		out = append(out, *m)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }

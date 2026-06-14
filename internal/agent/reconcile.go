@@ -19,11 +19,13 @@ import (
 // it's written by the API server goroutine and read by the loop. The loop
 // itself is a single goroutine that owns all VMM interaction.
 type Reconciler struct {
-	node     string
-	vmm      vmm.VMM
-	clock    Clock
-	interval time.Duration
-	log      *slog.Logger
+	node      string
+	vmm       vmm.VMM
+	clock     Clock
+	interval  time.Duration
+	log       *slog.Logger
+	nextAt    time.Time // next virtual time to reconcile
+	startedAt time.Time
 
 	mu      sync.Mutex
 	desired map[string]DesiredVM
@@ -105,16 +107,15 @@ func (r *Reconciler) snapshotDesired() map[string]DesiredVM {
 	return out
 }
 
-// Run drives the reconcile loop until ctx is cancelled. On shutdown the loop
-// simply stops — it does not tear down VMs, because "murmurd exited" must not
-// mean "kill the workloads"; that decision belongs to desired state, not to
-// process lifetime.
+// Run drives the reconcile loop under the real clock until ctx is cancelled. On
+// shutdown the loop simply stops — it does not tear down VMs, because "murmurd
+// exited" must not mean "kill the workloads"; that decision belongs to desired
+// state, not to process lifetime. Like the other components, it's a thin pacing
+// loop over Tick so the simulator can drive the same logic deterministically.
 func (r *Reconciler) Run(ctx context.Context) {
 	r.log.Info("reconciler started", "interval", r.interval)
 	for {
-		// Reconcile immediately, then wait a tick. Reconciling first means a
-		// freshly-set desired state converges without waiting a full interval.
-		r.reconcileOnce(ctx)
+		r.Tick(ctx, r.clock.Now())
 		select {
 		case <-ctx.Done():
 			r.log.Info("reconciler stopped")
@@ -122,6 +123,20 @@ func (r *Reconciler) Run(ctx context.Context) {
 		case <-r.clock.After(r.interval):
 		}
 	}
+}
+
+// Tick runs a reconcile pass if the interval has elapsed at virtual time now.
+// Single entry point for both Run and the deterministic simulator.
+func (r *Reconciler) Tick(ctx context.Context, now time.Time) {
+	if r.startedAt.IsZero() {
+		r.startedAt = now
+		r.nextAt = now // reconcile immediately on first tick
+	}
+	if now.Before(r.nextAt) {
+		return
+	}
+	r.nextAt = now.Add(r.interval)
+	r.reconcileOnce(ctx)
 }
 
 // reconcileOnce performs exactly one convergence pass. Exported-ish for tests

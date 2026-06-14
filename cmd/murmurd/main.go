@@ -141,8 +141,8 @@ func main() {
 	}
 
 	// Market scheduler: claims unowned/dead-owned desired VMs up to capacity.
-	sched := market.New(*node, *capacity, store, livenessOf(sw, *node), hasQuorum, clock.RealClock{}, log)
-	go sched.Run(ctx, *interval)
+	sched := market.New(*node, *capacity, store, livenessOf(sw, *node), hasQuorum, *interval, clock.RealClock{}, log)
+	go sched.Run(ctx)
 
 	// Snapshot loop: periodically snapshot the VMs I own so a survivor can restore
 	// them after I die. Cadence is the durability/RPO knob.

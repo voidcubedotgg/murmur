@@ -193,8 +193,22 @@ the fencing/leases discussion in DDIA.
 **Build:** drive the whole cluster on a simulated clock and network so you can
 replay exact failure sequences and shrink bugs deterministically.
 
+**Done (`internal/sim`):** single-threaded simulator — every node's SWIM, store,
+market, reconciler, and fake VMM run on ONE goroutine, on a virtual `SimClock`,
+over the `SimNet`, stepped in a seed-shuffled order. The three nondeterminism
+sources are removed: clock (virtual), network (SimNet), and goroutine scheduling
+(single-threaded seeded order) — plus every behaviour-affecting **map iteration
+is sorted** (Go map order is randomized; that was the last hidden source). A run
+is a pure function of its seed: `TestSim_Replayable` runs the same seed twice and
+asserts byte-identical observable state; `TestSim_ManySeedsFencingSafe` checks the
+no-two-owners invariant across 40 seeds and reports the failing seed. Live `Run`
+loops were refactored into thin pacing wrappers over the same `Tick`/`Deliver`
+core the simulator drives, so sim and production share one implementation.
+
 **You can explain:** why wall-clock-and-real-network tests can't catch the bugs
-that matter, and how FoundationDB/TigerBeetle find theirs.
+that matter (you can't replay the interleaving that triggered them), why even a
+single goroutine isn't deterministic until map iteration is ordered, and how
+FoundationDB/TigerBeetle find theirs.
 
 **Read:** FoundationDB's testing talk; TigerBeetle's simulation-testing writeups;
 Jepsen analyses.

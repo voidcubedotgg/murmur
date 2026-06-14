@@ -101,8 +101,8 @@ func startPeerFenced(t *testing.T, swimNet, stateNet *cluster.SimNet, snapDir, i
 	})
 	go r.Run(ctx)
 
-	sched := market.New(id, capacity, store, sw, hasQuorum, clock.RealClock{}, quiet())
-	go sched.Run(ctx, 50*time.Millisecond)
+	sched := market.New(id, capacity, store, sw, hasQuorum, 50*time.Millisecond, clock.RealClock{}, quiet())
+	go sched.Run(ctx)
 
 	return &peer{id: id, store: store, swim: sw, fake: fake, cancel: cancel}
 }

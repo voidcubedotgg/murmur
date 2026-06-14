@@ -3,30 +3,55 @@ package state
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"time"
+
+	"github.com/voidcubedotgg/murmur/internal/cluster"
 )
 
-// Run drives anti-entropy gossip until ctx is cancelled. Each period it pushes
-// its full CRDT state to one random peer; received state is merged. Because the
-// CRDT merge is commutative/associative/idempotent, this random pairwise
-// exchange converges the whole cluster without any coordinator — losing,
-// reordering, or duplicating a packet only delays convergence, never breaks it.
+// Run drives anti-entropy gossip under the real clock until ctx is cancelled —
+// a thin pacing loop over Tick/Deliver, the same logic the simulator drives.
+// Each period it pushes its full CRDT state to one random peer; received state
+// is merged. Because the CRDT merge is commutative/associative/idempotent, this
+// random pairwise exchange converges the whole cluster without any coordinator —
+// losing, reordering, or duplicating a packet only delays convergence.
 func (s *Store) Run(ctx context.Context, period time.Duration) {
+	s.gossipEvery = period
 	s.log.Info("state gossip started", "addr", s.selfAddr, "period", period)
-	next := s.pick.After(period)
 	for {
 		select {
 		case <-ctx.Done():
 			s.log.Info("state gossip stopped")
 			return
-		case <-next:
-			s.gossipOnce(ctx)
-			next = s.pick.After(period)
+		case <-s.pick.After(period):
+			s.Tick(s.pick.Now())
 		case pkt := <-s.tr.Receive():
-			s.onPacket(pkt.Payload)
+			s.Deliver(pkt)
 		}
 	}
 }
+
+// Tick pushes state to a random peer if the gossip interval has elapsed at
+// virtual time now. SetGossipInterval (or Run) must have set the period.
+func (s *Store) Tick(now time.Time) {
+	if s.gossipEvery <= 0 {
+		return
+	}
+	if s.nextAt.IsZero() {
+		s.nextAt = now
+	}
+	if now.Before(s.nextAt) {
+		return
+	}
+	s.nextAt = now.Add(s.gossipEvery)
+	s.gossipOnce(context.Background())
+}
+
+// Deliver merges one inbound gossip packet.
+func (s *Store) Deliver(pkt cluster.Packet) { s.onPacket(pkt.Payload) }
+
+// SetGossipInterval sets the gossip period for Tick-driven (simulator) use.
+func (s *Store) SetGossipInterval(d time.Duration) { s.gossipEvery = d }
 
 func (s *Store) gossipOnce(ctx context.Context) {
 	s.mu.Lock()
@@ -34,6 +59,7 @@ func (s *Store) gossipOnce(ctx context.Context) {
 	for p := range s.peers {
 		peers = append(peers, p)
 	}
+	sort.Strings(peers) // deterministic peer order before the seeded random pick
 	payload := wire{From: s.selfAddr, Desired: s.desired.Raw(), Claims: s.claims.Raw(), Peers: peers}
 	s.mu.Unlock()
 

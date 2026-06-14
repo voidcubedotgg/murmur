@@ -56,10 +56,16 @@ type SWIM struct {
 	gossip []gossipItem
 
 	// curProbe is the in-flight probe this period (SWIM probes one node/period).
+	//
+	// Timing is expressed as virtual DEADLINES (not timer channels) so the exact
+	// same logic runs under the real clock (Run polls Tick) and under the
+	// deterministic simulator (the driver calls Tick(now) directly). A zero
+	// deadline means inactive.
 	curProbe *probe
-	directCh <-chan time.Time
-	finalCh  <-chan time.Time
-	periodCh <-chan time.Time
+	directAt time.Time // when the direct-probe ack window expires (-> go indirect)
+	finalAt  time.Time // when the indirect window expires (-> Suspect)
+	periodAt time.Time // when the next protocol period fires
+	started  bool
 
 	// relays maps a target we're indirectly probing on someone's behalf to the
 	// address we must forward the ack to.
@@ -150,35 +156,69 @@ func (s *SWIM) pingSeeds(ctx context.Context) {
 	}
 }
 
-// Run drives the protocol until ctx is cancelled. Everything happens in this one
-// goroutine: timers and inbound packets are serialized through the select, so no
-// locks are needed for protocol state (only the member list, which outsiders
-// read, is mutex-guarded).
+// granularity is how often the live Run loop polls Tick. Small enough that
+// deadlines are honoured promptly; only affects the live (non-sim) path.
+func (s *SWIM) granularity() time.Duration {
+	g := s.cfg.AckTimeout / 2
+	if g <= 0 {
+		g = s.cfg.Period / 4
+	}
+	if g <= 0 {
+		g = 10 * time.Millisecond
+	}
+	return g
+}
+
+// Run drives the protocol under the real clock until ctx is cancelled. It is a
+// thin pacing loop over the same Tick/Deliver core the simulator uses: poll the
+// clock, deliver packets, advance deadlines. No protocol logic lives here.
 func (s *SWIM) Run(ctx context.Context) {
 	s.log.Info("swim started", "period", s.cfg.Period, "addr", s.ml.selfAddr)
-	// Prompt bootstrap: don't wait a full period to first contact the seeds.
-	s.pingSeeds(ctx)
-	s.periodCh = s.clk.After(s.cfg.Period)
+	g := s.granularity()
 	for {
 		select {
 		case <-ctx.Done():
 			s.log.Info("swim stopped")
 			return
-		case <-s.periodCh:
-			s.onPeriod(ctx)
-			s.periodCh = s.clk.After(s.cfg.Period)
-		case <-s.directCh:
-			s.onDirectTimeout(ctx)
-		case <-s.finalCh:
-			s.onFinalTimeout()
 		case pkt := <-s.tr.Receive():
-			s.onPacket(ctx, pkt)
+			s.Deliver(pkt)
+		case <-s.clk.After(g):
+			s.Tick(s.clk.Now())
 		}
 	}
 }
 
+// Tick advances the protocol to virtual time now, firing any due deadlines. It
+// is the single entry point for time in both the live loop and the simulator.
+func (s *SWIM) Tick(now time.Time) {
+	ctx := context.Background()
+	if !s.started {
+		// Prompt bootstrap: contact seeds and fire a period immediately.
+		s.started = true
+		s.pingSeeds(ctx)
+		s.periodAt = now
+	}
+	// Order matters and is fixed for determinism: resolve an in-flight probe's
+	// timeouts before starting a new period.
+	if !s.directAt.IsZero() && !now.Before(s.directAt) {
+		s.directAt = time.Time{}
+		s.onDirectTimeout(ctx, now)
+	}
+	if !s.finalAt.IsZero() && !now.Before(s.finalAt) {
+		s.finalAt = time.Time{}
+		s.onFinalTimeout()
+	}
+	if !now.Before(s.periodAt) {
+		s.periodAt = now.Add(s.cfg.Period)
+		s.onPeriod(ctx, now)
+	}
+}
+
+// Deliver feeds one inbound packet to the protocol.
+func (s *SWIM) Deliver(pkt Packet) { s.onPacket(context.Background(), pkt) }
+
 // onPeriod ages suspicions into deaths, then starts a fresh probe.
-func (s *SWIM) onPeriod(ctx context.Context) {
+func (s *SWIM) onPeriod(ctx context.Context, now time.Time) {
 	for _, id := range s.ml.agingSuspects(s.cfg.SuspicionTimeout) {
 		if u, ok := s.ml.setState(id, Dead); ok {
 			s.log.Warn("member declared DEAD (suspicion timed out)", "node", id, "incarnation", u.Incarnation)
@@ -197,15 +237,15 @@ func (s *SWIM) onPeriod(ctx context.Context) {
 	s.seq++
 	s.curProbe = &probe{seq: s.seq, target: t.ID, targetAddr: t.Addr}
 	s.send(ctx, t.Addr, Message{Type: msgPing, Seq: s.seq, About: s.self, Target: t.ID})
-	s.directCh = s.clk.After(s.cfg.AckTimeout)
-	s.finalCh = nil
+	s.directAt = now.Add(s.cfg.AckTimeout)
+	s.finalAt = time.Time{}
 }
 
 // onDirectTimeout fires when a direct ping went unanswered. Rather than suspect
 // immediately (the target might just be slow, or our direct path lossy), we ask
 // k other members to probe it indirectly. This is SWIM's key false-positive
 // reducer: it takes several independent failures to condemn a node.
-func (s *SWIM) onDirectTimeout(ctx context.Context) {
+func (s *SWIM) onDirectTimeout(ctx context.Context, now time.Time) {
 	if s.curProbe == nil {
 		return
 	}
@@ -225,9 +265,9 @@ func (s *SWIM) onDirectTimeout(ctx context.Context) {
 			TargetAddr: s.curProbe.targetAddr,
 		})
 	}
-	s.directCh = nil
+	s.directAt = time.Time{}
 	// Give the indirect path one more ack window.
-	s.finalCh = s.clk.After(s.cfg.AckTimeout)
+	s.finalAt = now.Add(s.cfg.AckTimeout)
 }
 
 // onFinalTimeout fires when neither the direct nor any indirect probe was
@@ -247,8 +287,8 @@ func (s *SWIM) onFinalTimeout() {
 
 func (s *SWIM) clearProbe() {
 	s.curProbe = nil
-	s.directCh = nil
-	s.finalCh = nil
+	s.directAt = time.Time{}
+	s.finalAt = time.Time{}
 }
 
 // onPacket merges piggybacked gossip, then handles the message by type.

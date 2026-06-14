@@ -11,6 +11,7 @@ package market
 import (
 	"context"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/voidcubedotgg/murmur/internal/clock"
@@ -31,6 +32,8 @@ type Scheduler struct {
 	store     *state.Store
 	live      Membership
 	hasQuorum func() bool
+	interval  time.Duration
+	nextAt    time.Time
 	clk       clock.Clock
 	log       *slog.Logger
 }
@@ -38,7 +41,7 @@ type Scheduler struct {
 // New builds a scheduler. hasQuorum (may be nil = always) gates claiming: a peer
 // that can't see a majority of the cluster must not grab work, because a
 // partitioned minority claiming is precisely how you end up with two owners.
-func New(self string, capacity int, store *state.Store, live Membership, hasQuorum func() bool, clk clock.Clock, log *slog.Logger) *Scheduler {
+func New(self string, capacity int, store *state.Store, live Membership, hasQuorum func() bool, interval time.Duration, clk clock.Clock, log *slog.Logger) *Scheduler {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -46,25 +49,36 @@ func New(self string, capacity int, store *state.Store, live Membership, hasQuor
 		capacity = 1
 	}
 	return &Scheduler{
-		self: self, capacity: capacity, store: store, live: live, hasQuorum: hasQuorum, clk: clk,
-		log: log.With("component", "market", "node", self),
+		self: self, capacity: capacity, store: store, live: live, hasQuorum: hasQuorum,
+		interval: interval, clk: clk, log: log.With("component", "market", "node", self),
 	}
 }
 
-// Run drives the market loop until ctx is cancelled.
-func (s *Scheduler) Run(ctx context.Context, interval time.Duration) {
+// Run drives the market under the real clock until ctx is cancelled — a thin
+// pacing loop over Tick, the same logic the simulator drives deterministically.
+func (s *Scheduler) Run(ctx context.Context) {
 	s.log.Info("market started", "capacity", s.capacity)
-	next := s.clk.After(interval)
 	for {
 		select {
 		case <-ctx.Done():
 			s.log.Info("market stopped")
 			return
-		case <-next:
-			s.scheduleOnce()
-			next = s.clk.After(interval)
+		case <-s.clk.After(s.interval):
+			s.Tick(s.clk.Now())
 		}
 	}
+}
+
+// Tick runs a scheduling pass if the interval has elapsed at virtual time now.
+func (s *Scheduler) Tick(now time.Time) {
+	if s.nextAt.IsZero() {
+		s.nextAt = now
+	}
+	if now.Before(s.nextAt) {
+		return
+	}
+	s.nextAt = now.Add(s.interval)
+	s.scheduleOnce()
 }
 
 // owned reports whether claim c is held by a peer we believe alive.
@@ -82,16 +96,26 @@ func (s *Scheduler) scheduleOnce() {
 	if s.hasQuorum != nil && !s.hasQuorum() {
 		return
 	}
-	desired := s.store.Desired()
+	desired := s.store.Desired() // sorted by name (deterministic)
 	desiredNames := make(map[string]bool, len(desired))
 	for _, d := range desired {
 		desiredNames[d.Name] = true
 	}
 	claims := s.store.Claims()
 
+	// Iterate claims in a sorted order — map order is randomized and our decisions
+	// (which claims to release, capacity counting) must be deterministic to be
+	// replayable under the simulator.
+	claimNames := make([]string, 0, len(claims))
+	for name := range claims {
+		claimNames = append(claimNames, name)
+	}
+	sort.Strings(claimNames)
+
 	// Count what I currently, livingly own — that's my load against capacity.
 	mine := 0
-	for name, c := range claims {
+	for _, name := range claimNames {
+		c := claims[name]
 		if c.Owner == s.self && desiredNames[name] {
 			mine++
 		}

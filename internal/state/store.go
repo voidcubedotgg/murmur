@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"log/slog"
 	"math/rand"
+	"sort"
 	"sync"
+	"time"
 
 	"github.com/voidcubedotgg/murmur/internal/clock"
 	"github.com/voidcubedotgg/murmur/internal/cluster"
@@ -49,10 +51,12 @@ type Store struct {
 	claims  *crdt.LWWMap
 	peers   map[string]bool
 
-	tr   cluster.Transport
-	pick clock.Clock
-	rnd  *rand.Rand
-	log  *slog.Logger
+	tr          cluster.Transport
+	pick        clock.Clock
+	rnd         *rand.Rand
+	log         *slog.Logger
+	gossipEvery time.Duration // set by Run or SetGossipInterval
+	nextAt      time.Time     // next virtual time to gossip
 }
 
 // New builds a store. selfAddr is this peer's state-gossip address; seeds bootstrap.
@@ -103,7 +107,10 @@ func (s *Store) RemoveDesired(name string) {
 	s.log.Info("desired removed", "vm", name)
 }
 
-// Desired returns all live desired specs.
+// Desired returns all live desired specs, sorted by name. The sort matters for
+// determinism: callers (e.g. the market) make capacity-limited decisions by
+// iterating this, and Go map order is randomized — unsorted, two replays of the
+// same seed would pick different VMs.
 func (s *Store) Desired() []Spec {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -114,6 +121,7 @@ func (s *Store) Desired() []Spec {
 			out = append(out, sp)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
