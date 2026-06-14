@@ -63,8 +63,8 @@ func main() {
 			os.Exit(1)
 		}
 		sw := cluster.NewSWIM("control", *gossipAddr, cluster.DefaultConfig(), tr, clock.RealClock{}, nil, log)
-		go sw.Run(ctx)
 		sw.Join(ctx, splitSeeds(*seeds))
+		go sw.Run(ctx)
 		live = sw
 	}
 

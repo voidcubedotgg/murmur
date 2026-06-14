@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/voidcubedotgg/murmur/internal/clock"
@@ -63,6 +64,14 @@ type SWIM struct {
 	// relays maps a target we're indirectly probing on someone's behalf to the
 	// address we must forward the ack to.
 	relays map[string]string
+
+	// seeds are the bootstrap addresses. We keep re-pinging them whenever we
+	// have no known-alive peers: a single lost UDP join packet must not isolate
+	// a node forever (SWIM only probes members it already knows, so without this
+	// a failed bootstrap never recovers). Guarded by seedMu because Join is
+	// called from another goroutine than the Run loop.
+	seedMu sync.Mutex
+	seeds  []string
 }
 
 type probe struct {
@@ -103,13 +112,26 @@ func (s *SWIM) Alive(id string) bool {
 	return ok && st == Alive
 }
 
-// Join bootstraps membership by pinging seed addresses. We may not know the
-// seeds' IDs yet; their acks (which piggyback their self-update) teach us.
-func (s *SWIM) Join(ctx context.Context, seeds []string) {
+// Join records seed addresses to bootstrap from. The actual pinging happens
+// inside the Run loop (so all sends stay on the one owning goroutine); the loop
+// re-pings seeds whenever it has no known-alive peers, so a lost join packet
+// over a lossy network simply gets retried instead of isolating us forever.
+func (s *SWIM) Join(_ context.Context, seeds []string) {
+	s.seedMu.Lock()
+	s.seeds = append(s.seeds, seeds...)
+	s.seedMu.Unlock()
+}
+
+// pingSeeds is called from the Run loop only.
+func (s *SWIM) pingSeeds(ctx context.Context) {
+	s.seedMu.Lock()
+	seeds := append([]string(nil), s.seeds...)
+	s.seedMu.Unlock()
 	for _, addr := range seeds {
 		if addr == "" || addr == s.ml.selfAddr {
 			continue
 		}
+		// A bare ping with no known target id; the seed's ack teaches us its id.
 		s.send(ctx, addr, Message{Type: msgPing, About: ""})
 	}
 }
@@ -120,6 +142,8 @@ func (s *SWIM) Join(ctx context.Context, seeds []string) {
 // read, is mutex-guarded).
 func (s *SWIM) Run(ctx context.Context) {
 	s.log.Info("swim started", "period", s.cfg.Period, "addr", s.ml.selfAddr)
+	// Prompt bootstrap: don't wait a full period to first contact the seeds.
+	s.pingSeeds(ctx)
 	s.periodCh = s.clk.After(s.cfg.Period)
 	for {
 		select {
@@ -150,6 +174,8 @@ func (s *SWIM) onPeriod(ctx context.Context) {
 
 	targets := s.ml.aliveOthers("")
 	if len(targets) == 0 {
+		// Isolated: keep trying to (re)join via seeds rather than going silent.
+		s.pingSeeds(ctx)
 		s.clearProbe()
 		return
 	}
@@ -326,14 +352,19 @@ func (s *SWIM) retransmits() int {
 	return r
 }
 
-// drainGossip returns up to GossipFanout updates to piggyback, always including
-// our own self-update, decrementing budgets and dropping exhausted items.
+// drainGossip returns updates to piggyback: our own self-update, then queued
+// change-driven updates (highest priority, with retransmit budgets), then — if
+// room remains — a few random members as anti-entropy so the whole view
+// converges even when a change update was lost in flight.
 func (s *SWIM) drainGossip() []Update {
 	out := []Update{s.ml.selfUpdate()}
+	included := map[string]bool{s.self: true}
+
 	kept := s.gossip[:0]
 	for _, it := range s.gossip {
 		if len(out) < s.cfg.GossipFanout && it.left > 0 {
 			out = append(out, it.u)
+			included[it.u.Node] = true
 			it.left--
 		}
 		if it.left > 0 {
@@ -341,6 +372,11 @@ func (s *SWIM) drainGossip() []Update {
 		}
 	}
 	s.gossip = kept
+
+	// Anti-entropy backstop: fill any remaining slots with random members.
+	if room := s.cfg.GossipFanout - len(out); room > 0 {
+		out = append(out, s.ml.randomUpdates(room, s.rnd.Perm, included)...)
+	}
 	return out
 }
 

@@ -59,8 +59,8 @@ func main() {
 			os.Exit(1)
 		}
 		sw := cluster.NewSWIM(*node, *gossipAddr, cluster.DefaultConfig(), tr, clock.RealClock{}, nil, log)
-		go sw.Run(ctx)
 		sw.Join(ctx, splitSeeds(*seeds))
+		go sw.Run(ctx)
 	}
 
 	srv := agent.NewServer(r, log.With("node", *node))

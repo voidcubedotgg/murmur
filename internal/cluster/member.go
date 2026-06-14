@@ -182,6 +182,37 @@ func (ml *memberList) agingSuspects(timeout time.Duration) []string {
 	return out
 }
 
+// randomUpdates returns up to n random members' current state as Updates,
+// skipping any id in exclude. This is the anti-entropy backstop: by constantly
+// re-gossiping a few random members (not only changed ones), the full
+// membership view converges everywhere even if a change-driven update was lost
+// before reaching some node. Pure SWIM lacks this and can sit in partial
+// convergence forever — which is exactly the bug this fixes.
+func (ml *memberList) randomUpdates(n int, perm func(int) []int, exclude map[string]bool) []Update {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+	all := make([]*Member, 0, len(ml.members))
+	for id, m := range ml.members {
+		if exclude[id] {
+			continue
+		}
+		all = append(all, m)
+	}
+	if len(all) == 0 {
+		return nil
+	}
+	order := perm(len(all))
+	out := make([]Update, 0, n)
+	for _, i := range order {
+		if len(out) >= n {
+			break
+		}
+		m := all[i]
+		out = append(out, Update{Node: m.ID, Addr: m.Addr, State: m.State, Incarnation: m.Incarnation})
+	}
+	return out
+}
+
 // snapshot returns a stable copy for external readers.
 func (ml *memberList) snapshot() []Member {
 	ml.mu.Lock()

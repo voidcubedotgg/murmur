@@ -164,6 +164,25 @@ func TestPartitionThenHeal(t *testing.T) {
 	}, "cluster heals back to all-alive")
 }
 
+// Bootstrap must survive a lossy network: with heavy packet loss a single join
+// packet often vanishes, so the loop has to keep retrying via seeds (and
+// anti-entropy must fill in the view). Without those fixes a node could be
+// isolated forever.
+func TestJoinSurvivesPacketLoss(t *testing.T) {
+	net := NewSimNet(0.5, rand.New(rand.NewSource(7))) // drop half of all packets
+	nodes := startCluster(t, net, "a", "b", "c")
+	eventually(t, 4*time.Second, func() bool {
+		for _, n := range nodes {
+			for _, id := range []string{"a", "b", "c"} {
+				if belief(n, id) != Alive {
+					return false
+				}
+			}
+		}
+		return true
+	}, "cluster still converges despite 50% packet loss")
+}
+
 // A restarted member (fresh process, same id, incarnation reset) rejoins and is
 // believed Alive again, even though peers had marked it Dead.
 func TestRejoinAfterDeath(t *testing.T) {
