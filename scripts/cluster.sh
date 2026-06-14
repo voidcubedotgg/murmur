@@ -48,7 +48,7 @@ up() {
       swim_seedflag="--seeds $SWIM_SEED"
       state_seedflag="--state-seeds $STATE_SEED"
     fi
-    "$BIN/murmurd" --fake --node "$id" \
+    "$BIN/murmurd" --fake --node "$id" --capacity 2 \
       --gossip-addr "$swim" $swim_seedflag \
       --state-addr "$state" $state_seedflag \
       2>"/tmp/$id.log" &
@@ -60,13 +60,21 @@ up() {
 
 down()  { kill_orphans; echo "cluster down"; }
 nodes() { "$BIN/murmurctl" --peer host-a nodes; }
-ps()    { "$BIN/murmurctl" --peer host-a ps; }
+ps()    { "$BIN/murmurctl" --peer "${1:-host-a}" ps; }
+
+# kill one peer (out-of-band failure) to demo re-claim + restore.
+killnode() {
+  local id="${1:?usage: cluster.sh kill host-X}"
+  pkill -9 -f "node $id " 2>/dev/null || pkill -9 -f "node $id$" 2>/dev/null || true
+  echo "killed $id"
+}
 
 cmd="${1:-up}"; shift || true
 case "$cmd" in
   up)    up "$@" ;;
   down)  down ;;
   nodes) nodes ;;
-  ps)    ps ;;
-  *) echo "usage: $0 {up [N]|down|nodes|ps}" >&2; exit 2 ;;
+  ps)    ps "$@" ;;
+  kill)  killnode "$@" ;;
+  *) echo "usage: $0 {up [N]|down|nodes|ps [peer]|kill host-X}" >&2; exit 2 ;;
 esac

@@ -1,8 +1,8 @@
-// Package state is murmur's replicated desired-state store. It wraps a CRDT
-// (internal/crdt LWWMap) of VM assignments and anti-entropy-gossips it to peers
-// over a cluster.Transport. There is no leader and no central copy: every peer
-// holds the full map and they converge by exchanging state. It knows nothing
-// about VMs beyond treating an Assignment as opaque data to replicate.
+// Package state is murmur's replicated desired-state store. It holds two CRDTs —
+// the *desired* set (what VMs the user wants) and the *claims* map (who owns/runs
+// each, decided by the market) — and anti-entropy-gossips both to peers over a
+// cluster.Transport. No leader, no central copy: peers converge by exchanging
+// state. It knows nothing about VMs beyond replicating opaque records.
 package state
 
 import (
@@ -16,32 +16,38 @@ import (
 	"github.com/voidcubedotgg/murmur/internal/crdt"
 )
 
-// Assignment is one desired VM and the node meant to run it. (Stage 3 sets Node
-// manually; Stage 4 will let the market decide it via a claim.)
-type Assignment struct {
+// Spec is a desired VM (user intent). No node: placement is the market's job.
+type Spec struct {
 	Name  string `json:"name"`
 	Image string `json:"image,omitempty"`
-	Node  string `json:"node"`
 }
 
-// wire is the anti-entropy gossip payload: a full dump of the CRDT plus the
-// sender's known peers (so the peer graph becomes fully connected over time,
-// not just a star around the seeds).
+// Claim is the market's decision about a VM: which peer owns (runs) it, and the
+// snapshot a new owner should restore from. Owner "" means unclaimed/up-for-grabs.
+type Claim struct {
+	Owner       string `json:"owner"`
+	SnapshotRef string `json:"snapshot_ref,omitempty"`
+}
+
+// wire is the anti-entropy gossip payload: full dumps of both CRDTs plus known
+// peers (so the gossip graph self-connects beyond the seed star).
 type wire struct {
 	From    string                `json:"from"`
-	Entries map[string]crdt.Entry `json:"entries"`
+	Desired map[string]crdt.Entry `json:"desired"`
+	Claims  map[string]crdt.Entry `json:"claims"`
 	Peers   []string              `json:"peers,omitempty"`
 }
 
-// Store is one peer's replica.
+// Store is one peer's replica of desired + claims.
 type Store struct {
 	node     string
 	selfAddr string
 
-	mu    sync.Mutex
-	clk   *crdt.Lamport
-	m     *crdt.LWWMap
-	peers map[string]bool // peer state-gossip addresses
+	mu      sync.Mutex
+	clk     *crdt.Lamport
+	desired *crdt.LWWMap
+	claims  *crdt.LWWMap
+	peers   map[string]bool
 
 	tr   cluster.Transport
 	pick clock.Clock
@@ -49,8 +55,7 @@ type Store struct {
 	log  *slog.Logger
 }
 
-// New builds a store. selfAddr is this peer's state-gossip address; seeds are
-// other peers' state-gossip addresses to bootstrap from.
+// New builds a store. selfAddr is this peer's state-gossip address; seeds bootstrap.
 func New(node, selfAddr string, seeds []string, tr cluster.Transport, pick clock.Clock, rnd *rand.Rand, log *slog.Logger) *Store {
 	if log == nil {
 		log = slog.Default()
@@ -68,7 +73,8 @@ func New(node, selfAddr string, seeds []string, tr cluster.Transport, pick clock
 		node:     node,
 		selfAddr: selfAddr,
 		clk:      crdt.NewLamport(node),
-		m:        crdt.NewLWWMap(),
+		desired:  crdt.NewLWWMap(),
+		claims:   crdt.NewLWWMap(),
 		peers:    peers,
 		tr:       tr,
 		pick:     pick,
@@ -77,50 +83,75 @@ func New(node, selfAddr string, seeds []string, tr cluster.Transport, pick clock
 	}
 }
 
-// Set records a desired assignment, stamping it with our Lamport clock. Local
-// writes converge with everyone else's by stamp ordering.
-func (s *Store) Set(a Assignment) {
-	b, _ := json.Marshal(a)
+// --- desired set --------------------------------------------------------
+
+// SetDesired records that the user wants this VM (stamped via our clock).
+func (s *Store) SetDesired(spec Spec) {
+	b, _ := json.Marshal(spec)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.m.Set(a.Name, b, s.clk.Tick())
-	s.log.Info("desired set", "vm", a.Name, "node", a.Node)
+	s.desired.Set(spec.Name, b, s.clk.Tick())
+	s.log.Info("desired set", "vm", spec.Name)
 }
 
-// Remove tombstones an assignment.
-func (s *Store) Remove(name string) {
+// RemoveDesired tombstones a VM (and its claim, so survivors stop running it).
+func (s *Store) RemoveDesired(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.m.Delete(name, s.clk.Tick())
+	s.desired.Delete(name, s.clk.Tick())
+	s.claims.Delete(name, s.clk.Tick())
 	s.log.Info("desired removed", "vm", name)
 }
 
-// Snapshot returns all live assignments (converged view).
-func (s *Store) Snapshot() []Assignment {
+// Desired returns all live desired specs.
+func (s *Store) Desired() []Spec {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.decodeLocked()
-}
-
-// AssignmentsFor returns the live assignments targeted at a given node.
-func (s *Store) AssignmentsFor(node string) []Assignment {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var out []Assignment
-	for _, a := range s.decodeLocked() {
-		if a.Node == node {
-			out = append(out, a)
+	out := make([]Spec, 0)
+	for _, v := range s.desired.Entries() {
+		var sp Spec
+		if json.Unmarshal(v, &sp) == nil {
+			out = append(out, sp)
 		}
 	}
 	return out
 }
 
-func (s *Store) decodeLocked() []Assignment {
-	out := make([]Assignment, 0)
-	for _, v := range s.m.Entries() {
-		var a Assignment
-		if json.Unmarshal(v, &a) == nil {
-			out = append(out, a)
+// --- claims -------------------------------------------------------------
+
+// SetClaim writes a claim for a VM (stamped via our clock). Used by the market to
+// claim/re-claim, and by the owner to record a fresh SnapshotRef.
+func (s *Store) SetClaim(name string, c Claim) {
+	b, _ := json.Marshal(c)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.claims.Set(name, b, s.clk.Tick())
+}
+
+// Claim returns the current claim for a VM.
+func (s *Store) Claim(name string) (Claim, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.claims.Get(name)
+	if !ok {
+		return Claim{}, false
+	}
+	var c Claim
+	if json.Unmarshal(v, &c) != nil {
+		return Claim{}, false
+	}
+	return c, true
+}
+
+// Claims returns the converged claim per live-claimed VM.
+func (s *Store) Claims() map[string]Claim {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]Claim{}
+	for k, v := range s.claims.Entries() {
+		var c Claim
+		if json.Unmarshal(v, &c) == nil {
+			out[k] = c
 		}
 	}
 	return out

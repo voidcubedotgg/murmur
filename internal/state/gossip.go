@@ -34,7 +34,7 @@ func (s *Store) gossipOnce(ctx context.Context) {
 	for p := range s.peers {
 		peers = append(peers, p)
 	}
-	payload := wire{From: s.selfAddr, Entries: s.m.Raw(), Peers: peers}
+	payload := wire{From: s.selfAddr, Desired: s.desired.Raw(), Claims: s.claims.Raw(), Peers: peers}
 	s.mu.Unlock()
 
 	if len(peers) == 0 {
@@ -52,10 +52,14 @@ func (s *Store) onPacket(b []byte) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Merge the CRDT and advance our Lamport clock past everything we just saw,
+	// Merge both CRDTs and advance our Lamport clock past everything we just saw,
 	// so our future local writes order strictly after observed ones.
-	s.m.Merge(w.Entries)
-	for _, e := range w.Entries {
+	s.desired.Merge(w.Desired)
+	s.claims.Merge(w.Claims)
+	for _, e := range w.Desired {
+		s.clk.Witness(e.Stamp)
+	}
+	for _, e := range w.Claims {
 		s.clk.Witness(e.Stamp)
 	}
 	// Learn peers transitively so the gossip graph becomes fully connected

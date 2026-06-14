@@ -72,3 +72,23 @@ func stateOf(t *testing.T, v VMM, name string) State {
 	}
 	return Missing
 }
+
+// A snapshot taken by one Fake can be Restored by a DIFFERENT Fake instance
+// (sharing the snapshot dir) — the cross-peer state transfer the failover demo
+// needs, since the survivor never took the snapshot itself.
+func TestFakeSnapshotCrossInstance(t *testing.T) {
+	dir := t.TempDir()
+	owner := NewFakeWithSnapDir(dir)
+	mustBoot(t, owner, Spec{Name: "counter"})
+	ref, err := owner.Snapshot(context.Background(), "counter")
+	if err != nil {
+		t.Fatal(err)
+	}
+	survivor := NewFakeWithSnapDir(dir) // fresh instance, never saw the VM
+	if err := survivor.Restore(context.Background(), "counter", ref); err != nil {
+		t.Fatalf("survivor restore from shared snapshot: %v", err)
+	}
+	if stateOf(t, survivor, "counter") != Running {
+		t.Fatal("restored VM should be Running on the survivor")
+	}
+}

@@ -3,7 +3,10 @@ package vmm
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
+	"time"
 )
 
 // Fake is an in-memory VMM. It lets the agent and its tests run with zero real
@@ -15,17 +18,19 @@ type Fake struct {
 	mu    sync.Mutex
 	state map[string]State
 
-	// snaps records the last snapshot taken per VM, so Restore is meaningful
-	// in later stages without involving any real substrate.
-	snaps map[string]State
+	// snapDir is a SHARED directory where snapshots are written as files, so a
+	// Fake in a *different process* (a survivor peer) can Restore from a snapshot
+	// taken here. Real state would live in the smolvm artifact; this file is the
+	// fake's stand-in to make cross-peer state transfer real in the demo.
+	snapDir string
 }
 
-// NewFake returns an empty Fake VMM.
-func NewFake() *Fake {
-	return &Fake{
-		state: make(map[string]State),
-		snaps: make(map[string]State),
-	}
+// NewFake returns a Fake VMM using the default shared snapshot dir.
+func NewFake() *Fake { return NewFakeWithSnapDir(filepath.Join(os.TempDir(), "murmur-snap")) }
+
+// NewFakeWithSnapDir lets callers (and tests) pick the shared snapshot dir.
+func NewFakeWithSnapDir(dir string) *Fake {
+	return &Fake{state: make(map[string]State), snapDir: dir}
 }
 
 var _ VMM = (*Fake)(nil)
@@ -55,20 +60,30 @@ func (f *Fake) Kill(_ context.Context, name string) error {
 func (f *Fake) Snapshot(_ context.Context, name string) (SnapshotRef, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	st, ok := f.state[name]
-	if !ok {
+	if _, ok := f.state[name]; !ok {
 		return "", fmt.Errorf("vmm: snapshot of missing VM %q", name)
 	}
-	f.snaps[name] = st
-	return SnapshotRef("fake://" + name), nil
+	if err := os.MkdirAll(f.snapDir, 0o755); err != nil {
+		return "", fmt.Errorf("vmm: snapshot dir: %w", err)
+	}
+	path := filepath.Join(f.snapDir, name+".snap")
+	// Content stands in for VM state; the epoch lets you see snapshots advance.
+	content := fmt.Sprintf("%s@%d", name, time.Now().UnixNano())
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return "", fmt.Errorf("vmm: write snapshot: %w", err)
+	}
+	return SnapshotRef(path), nil
 }
 
 func (f *Fake) Restore(_ context.Context, name string, ref SnapshotRef) error {
+	// Read the shared snapshot file — works even though this Fake never took the
+	// snapshot itself (a different peer/process did). That's the cross-peer state
+	// transfer the failover demo needs.
+	if _, err := os.ReadFile(string(ref)); err != nil {
+		return fmt.Errorf("vmm: restore %q from %s: %w", name, ref, err)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.snaps[name]; !ok {
-		return fmt.Errorf("vmm: no snapshot for VM %q (ref %s)", name, ref)
-	}
 	f.state[name] = Running
 	return nil
 }

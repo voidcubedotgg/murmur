@@ -58,12 +58,12 @@ func run(c *http.Client, cmd string, args []string) error {
 }
 
 func cmdRun(c *http.Client, args []string) error {
-	var name, image, node string
-	parseFlags(args, map[string]*string{"--name": &name, "--image": &image, "--node": &node})
-	if name == "" || node == "" {
-		return fmt.Errorf("run: --name and --node required")
+	var name, image string
+	parseFlags(args, map[string]*string{"--name": &name, "--image": &image})
+	if name == "" {
+		return fmt.Errorf("run: --name required")
 	}
-	body, _ := json.Marshal(api.RunRequest{Name: name, Image: image, Node: node})
+	body, _ := json.Marshal(api.RunRequest{Name: name, Image: image})
 	resp, err := c.Post("http://unix/vms", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -72,7 +72,7 @@ func cmdRun(c *http.Client, args []string) error {
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("agent: %s", resp.Status)
 	}
-	fmt.Printf("recorded %q on %q (gossiping to peers)\n", name, node)
+	fmt.Printf("recorded %q (market will place it)\n", name)
 	return nil
 }
 
@@ -156,7 +156,7 @@ func parseFlags(args []string, into map[string]*string) {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  murmurctl [--peer NAME] run --name NAME --node NODE [--image IMAGE]
+  murmurctl [--peer NAME] run --name NAME [--image IMAGE]
   murmurctl [--peer NAME] ps
   murmurctl [--peer NAME] nodes
   murmurctl [--peer NAME] rm --name NAME`)

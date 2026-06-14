@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"log/slog"
-	"sort"
 	"sync"
 	"time"
 
@@ -27,19 +26,18 @@ type Reconciler struct {
 	log      *slog.Logger
 
 	mu      sync.Mutex
-	desired map[string]vmm.Spec
+	desired map[string]DesiredVM
 	// source, if set, is the authoritative desired set each reconcile pass — used
 	// in the CRDT path where desired state lives in the replicated store, not in
 	// this struct. When nil, the locally-set desired map is used (tests).
-	source func() []vmm.Spec
+	source func() []DesiredVM
 }
 
-// Status is a desired-vs-observed view of one VM, for `murmurctl ps`.
-type Status struct {
-	Name     string    `json:"name"`
-	Desired  bool      `json:"desired"`
-	Image    string    `json:"image,omitempty"`
-	Observed vmm.State `json:"observed"`
+// DesiredVM is one VM this node should run, plus the snapshot to restore from if
+// it's being recovered (re-claimed) rather than started fresh.
+type DesiredVM struct {
+	Spec        vmm.Spec
+	SnapshotRef vmm.SnapshotRef
 }
 
 // NewReconciler builds a reconciler. node labels every log line so that, once
@@ -54,24 +52,25 @@ func NewReconciler(node string, v vmm.VMM, clock Clock, interval time.Duration, 
 		clock:    clock,
 		interval: interval,
 		log:      log.With("node", node),
-		desired:  make(map[string]vmm.Spec),
+		desired:  make(map[string]DesiredVM),
 	}
 }
 
 // SetSource installs the authoritative desired-set provider (the replicated
-// CRDT store, filtered to this node). When set, it overrides the local desired
-// map on every reconcile pass.
-func (r *Reconciler) SetSource(src func() []vmm.Spec) {
+// CRDT store, filtered to this node's claims). When set, it overrides the local
+// desired map on every reconcile pass.
+func (r *Reconciler) SetSource(src func() []DesiredVM) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.source = src
 }
 
-// SetDesired declares that we want this VM running. Idempotent.
+// SetDesired declares that we want this VM running. Idempotent. (Tests use this;
+// the CRDT path uses SetSource instead.)
 func (r *Reconciler) SetDesired(spec vmm.Spec) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.desired[spec.Name] = spec
+	r.desired[spec.Name] = DesiredVM{Spec: spec}
 	r.log.Info("desired set", "vm", spec.Name, "image", spec.Image)
 }
 
@@ -86,20 +85,20 @@ func (r *Reconciler) RemoveDesired(name string) {
 
 // snapshotDesired returns a copy of the desired set so the loop never holds the
 // lock while talking to the (possibly slow) substrate.
-func (r *Reconciler) snapshotDesired() map[string]vmm.Spec {
+func (r *Reconciler) snapshotDesired() map[string]DesiredVM {
 	r.mu.Lock()
 	src := r.source
 	r.mu.Unlock()
 	if src != nil {
-		out := make(map[string]vmm.Spec)
-		for _, s := range src() {
-			out[s.Name] = s
+		out := make(map[string]DesiredVM)
+		for _, d := range src() {
+			out[d.Spec.Name] = d
 		}
 		return out
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make(map[string]vmm.Spec, len(r.desired))
+	out := make(map[string]DesiredVM, len(r.desired))
 	for k, v := range r.desired {
 		out[k] = v
 	}
@@ -142,14 +141,24 @@ func (r *Reconciler) reconcileOnce(ctx context.Context) {
 		obsState[o.Name] = o.State
 	}
 
-	// Converge desired VMs toward Running.
-	for name, spec := range desired {
+	// Converge desired VMs toward Running. If a desired VM carries a SnapshotRef
+	// (it was re-claimed from a dead owner), Restore it so it resumes with state
+	// rather than starting fresh; fall back to Boot if the snapshot is
+	// unreachable.
+	for name, d := range desired {
 		if obsState[name] == vmm.Running {
 			continue // already where we want it
 		}
-		r.log.Info("reconcile: booting",
-			"vm", name, "observed", string(obsStateOr(obsState, name)))
-		if err := r.vmm.Boot(ctx, spec); err != nil {
+		if d.SnapshotRef != "" {
+			r.log.Info("reconcile: restoring from snapshot", "vm", name, "ref", string(d.SnapshotRef))
+			if err := r.vmm.Restore(ctx, name, d.SnapshotRef); err == nil {
+				continue
+			} else {
+				r.log.Warn("restore failed; booting fresh", "vm", name, "err", err)
+			}
+		}
+		r.log.Info("reconcile: booting", "vm", name, "observed", string(obsStateOr(obsState, name)))
+		if err := r.vmm.Boot(ctx, d.Spec); err != nil {
 			r.log.Error("boot failed", "vm", name, "err", err)
 		}
 	}
@@ -179,38 +188,3 @@ func obsStateOr(m map[string]vmm.State, name string) vmm.State {
 // ReconcileOnce runs a single pass synchronously. Tests use it to drive the
 // loop deterministically without real time.
 func (r *Reconciler) ReconcileOnce(ctx context.Context) { r.reconcileOnce(ctx) }
-
-// PS returns the desired-vs-observed view for every VM that is either desired
-// or observed, sorted by name.
-func (r *Reconciler) PS(ctx context.Context) ([]Status, error) {
-	desired := r.snapshotDesired()
-	observed, err := r.vmm.List(ctx)
-	if err != nil {
-		return nil, err
-	}
-	obsState := make(map[string]vmm.State, len(observed))
-	for _, o := range observed {
-		obsState[o.Name] = o.State
-	}
-
-	names := map[string]struct{}{}
-	for n := range desired {
-		names[n] = struct{}{}
-	}
-	for n := range obsState {
-		names[n] = struct{}{}
-	}
-
-	out := make([]Status, 0, len(names))
-	for n := range names {
-		spec, want := desired[n]
-		out = append(out, Status{
-			Name:     n,
-			Desired:  want,
-			Image:    spec.Image,
-			Observed: obsStateOr(obsState, n),
-		})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out, nil
-}

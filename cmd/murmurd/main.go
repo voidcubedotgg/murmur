@@ -24,21 +24,25 @@ import (
 	"github.com/voidcubedotgg/murmur/internal/api"
 	"github.com/voidcubedotgg/murmur/internal/clock"
 	"github.com/voidcubedotgg/murmur/internal/cluster"
+	"github.com/voidcubedotgg/murmur/internal/market"
 	"github.com/voidcubedotgg/murmur/internal/state"
 	"github.com/voidcubedotgg/murmur/internal/vmm"
 )
 
 func main() {
 	var (
-		fake       = flag.Bool("fake", false, "use the in-memory fake VMM instead of smolvm")
-		node       = flag.String("node", hostname(), "node id (and gossip identity)")
-		interval   = flag.Duration("interval", 2*time.Second, "reconcile interval")
-		smolbin    = flag.String("smolvm", "smolvm", "smolvm binary path")
-		gossipAddr = flag.String("gossip-addr", "", "UDP address for SWIM membership gossip")
-		seeds      = flag.String("seeds", "", "comma-separated SWIM seed addresses")
-		stateAddr  = flag.String("state-addr", "", "UDP address for CRDT state gossip")
-		stateSeeds = flag.String("state-seeds", "", "comma-separated state-gossip seed addresses")
-		socket     = flag.String("socket", "", "murmurctl unix socket (default murmurd-<node>.sock)")
+		fake        = flag.Bool("fake", false, "use the in-memory fake VMM instead of smolvm")
+		node        = flag.String("node", hostname(), "node id (and gossip identity)")
+		interval    = flag.Duration("interval", 2*time.Second, "reconcile interval")
+		smolbin     = flag.String("smolvm", "smolvm", "smolvm binary path")
+		gossipAddr  = flag.String("gossip-addr", "", "UDP address for SWIM membership gossip")
+		seeds       = flag.String("seeds", "", "comma-separated SWIM seed addresses")
+		stateAddr   = flag.String("state-addr", "", "UDP address for CRDT state gossip")
+		stateSeeds  = flag.String("state-seeds", "", "comma-separated state-gossip seed addresses")
+		socket      = flag.String("socket", "", "murmurctl unix socket (default murmurd-<node>.sock)")
+		capacity    = flag.Int("capacity", 2, "max VMs this peer will claim")
+		snapEvery   = flag.Duration("snapshot-interval", 5*time.Second, "how often to snapshot owned VMs")
+		gossipEvery = flag.Duration("gossip-interval", 500*time.Millisecond, "state-gossip period")
 	)
 	flag.Parse()
 
@@ -69,24 +73,40 @@ func main() {
 		}
 		store = state.New(*node, *stateAddr, splitCSV(*stateSeeds), tr, clock.RealClock{},
 			rand.New(rand.NewSource(time.Now().UnixNano())), log)
-		go store.Run(ctx, *interval)
+		go store.Run(ctx, *gossipEvery)
 	} else {
 		// No gossip configured: a lone in-memory store so single-node runs work.
 		store = state.New(*node, "", nil, nil, clock.RealClock{}, nil, log)
 	}
 
-	// Reconciler: its desired set is the converged assignments for THIS node.
+	// Reconciler: runs exactly the VMs claimed by THIS node, restoring from the
+	// snapshot recorded in the claim when one exists (a re-claim from a dead peer).
 	r := agent.NewReconciler(*node, v, clock.RealClock{}, *interval, log)
-	r.SetSource(func() []vmm.Spec {
-		var specs []vmm.Spec
-		for _, a := range store.AssignmentsFor(*node) {
-			specs = append(specs, vmm.Spec{Name: a.Name, Image: a.Image})
+	r.SetSource(func() []agent.DesiredVM {
+		desired := map[string]state.Spec{}
+		for _, sp := range store.Desired() {
+			desired[sp.Name] = sp
 		}
-		return specs
+		var out []agent.DesiredVM
+		for name, c := range store.Claims() {
+			if c.Owner != *node {
+				continue
+			}
+			sp, ok := desired[name]
+			if !ok {
+				continue // claimed but no longer desired; reconciler will kill it
+			}
+			out = append(out, agent.DesiredVM{
+				Spec:        vmm.Spec{Name: name, Image: sp.Image},
+				SnapshotRef: vmm.SnapshotRef(c.SnapshotRef),
+			})
+		}
+		return out
 	})
 	go r.Run(ctx)
 
-	// SWIM membership (for `nodes` + future claim-liveness).
+	// SWIM membership: liveness oracle for the market (a claim is honoured only
+	// while its owner is Alive) and the `nodes` view.
 	var sw *cluster.SWIM
 	if *gossipAddr != "" {
 		tr, err := cluster.NewUDPTransport(*gossipAddr)
@@ -98,6 +118,14 @@ func main() {
 		sw.Join(ctx, splitCSV(*seeds))
 		go sw.Run(ctx)
 	}
+
+	// Market scheduler: claims unowned/dead-owned desired VMs up to capacity.
+	sched := market.New(*node, *capacity, store, livenessOf(sw, *node), clock.RealClock{}, log)
+	go sched.Run(ctx, *interval)
+
+	// Snapshot loop: periodically snapshot the VMs I own so a survivor can restore
+	// them after I die. Cadence is the durability/RPO knob.
+	go snapshotLoop(ctx, *node, *snapEvery, store, v, log)
 
 	if err := serve(ctx, *socket, newServer(*node, store, v, sw), log); err != nil {
 		log.Error("agent server exited", "err", err)
@@ -112,11 +140,12 @@ func newServer(node string, store *state.Store, v vmm.VMM, sw *cluster.SWIM) htt
 		switch req.Method {
 		case http.MethodPost:
 			var rr api.RunRequest
-			if err := json.NewDecoder(req.Body).Decode(&rr); err != nil || rr.Name == "" || rr.Node == "" {
-				http.Error(w, "bad request: need {name,node}", http.StatusBadRequest)
+			if err := json.NewDecoder(req.Body).Decode(&rr); err != nil || rr.Name == "" {
+				http.Error(w, "bad request: need {name}", http.StatusBadRequest)
 				return
 			}
-			store.Set(state.Assignment{Name: rr.Name, Image: rr.Image, Node: rr.Node})
+			// Just record intent; the market decides who runs it.
+			store.SetDesired(state.Spec{Name: rr.Name, Image: rr.Image})
 			w.WriteHeader(http.StatusAccepted)
 		case http.MethodGet:
 			writeJSON(w, psRows(req.Context(), node, store, v))
@@ -135,7 +164,7 @@ func newServer(node string, store *state.Store, v vmm.VMM, sw *cluster.SWIM) htt
 			http.Error(w, "bad request: need name", http.StatusBadRequest)
 			return
 		}
-		store.Remove(name)
+		store.RemoveDesired(name)
 		w.WriteHeader(http.StatusAccepted)
 	})
 
@@ -150,10 +179,10 @@ func newServer(node string, store *state.Store, v vmm.VMM, sw *cluster.SWIM) htt
 	return mux
 }
 
-// psRows joins the converged desired assignments with this peer's local
-// observation. We can only truthfully report Observed for VMs on our own node;
-// others show "-" (a peer doesn't observe another peer's VMM — that's a status
-// CRDT we could add later).
+// psRows joins desired VMs with their converged claim (OWNER) and this peer's
+// local observation. We can only truthfully report Observed for VMs WE own; for
+// others it's "-" (a peer doesn't observe another peer's VMM — that'd be a
+// status CRDT, left for later).
 func psRows(ctx context.Context, node string, store *state.Store, v vmm.VMM) []api.PSRow {
 	observed := map[string]vmm.State{}
 	if obs, err := v.List(ctx); err == nil {
@@ -161,20 +190,64 @@ func psRows(ctx context.Context, node string, store *state.Store, v vmm.VMM) []a
 			observed[o.Name] = o.State
 		}
 	}
+	claims := store.Claims()
 	var rows []api.PSRow
-	for _, a := range store.Snapshot() {
+	for _, sp := range store.Desired() {
+		owner := claims[sp.Name].Owner
 		o := "-"
-		if a.Node == node {
-			if st, ok := observed[a.Name]; ok {
+		if owner == node {
+			if st, ok := observed[sp.Name]; ok {
 				o = string(st)
 			} else {
 				o = string(vmm.Missing)
 			}
 		}
-		rows = append(rows, api.PSRow{Name: a.Name, Node: a.Node, Image: a.Image, Observed: o})
+		if owner == "" {
+			owner = "(unclaimed)"
+		}
+		rows = append(rows, api.PSRow{Name: sp.Name, Node: owner, Image: sp.Image, Observed: o})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
 	return rows
+}
+
+// alwaysAlive is the liveness oracle when membership is disabled (single-node
+// runs): the lone peer claims everything.
+type alwaysAlive struct{}
+
+func (alwaysAlive) Alive(string) bool { return true }
+
+func livenessOf(sw *cluster.SWIM, _ string) market.Membership {
+	if sw == nil {
+		return alwaysAlive{}
+	}
+	return sw
+}
+
+// snapshotLoop periodically snapshots the VMs this peer owns and records the
+// fresh SnapshotRef in the claim, so a survivor that re-claims after we die can
+// Restore rather than boot fresh. Cadence is the durability/RPO knob.
+func snapshotLoop(ctx context.Context, node string, every time.Duration, store *state.Store, v vmm.VMM, log *slog.Logger) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			for name, c := range store.Claims() {
+				if c.Owner != node {
+					continue
+				}
+				ref, err := v.Snapshot(ctx, name)
+				if err != nil {
+					continue // not running yet / nothing to snapshot
+				}
+				c.SnapshotRef = string(ref)
+				store.SetClaim(name, c)
+			}
+		}
+	}
 }
 
 func serve(ctx context.Context, sockPath string, h http.Handler, log *slog.Logger) error {
