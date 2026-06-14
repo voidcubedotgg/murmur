@@ -43,6 +43,11 @@ func eventually(t *testing.T, within time.Duration, cond func() bool, msg string
 }
 
 func startPeer(t *testing.T, swimNet, stateNet *cluster.SimNet, snapDir, id string, seedID string, capacity int) *peer {
+	return startPeerFenced(t, swimNet, stateNet, snapDir, id, seedID, capacity, false, 0)
+}
+
+// startPeerFenced wires a peer with optional quorum fencing, mirroring cmd/murmurd.
+func startPeerFenced(t *testing.T, swimNet, stateNet *cluster.SimNet, snapDir, id, seedID string, capacity int, fencing bool, clusterSize int) *peer {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -62,9 +67,20 @@ func startPeer(t *testing.T, swimNet, stateNet *cluster.SimNet, snapDir, id stri
 	sw.Join(ctx, swimSeeds)
 	go sw.Run(ctx)
 
+	quorum := clusterSize/2 + 1
+	hasQuorum := func() bool {
+		if !fencing {
+			return true
+		}
+		return sw.AliveCount() >= quorum
+	}
+
 	fake := vmm.NewFakeWithSnapDir(snapDir)
 	r := agent.NewReconciler(id, fake, clock.RealClock{}, 50*time.Millisecond, quiet())
 	r.SetSource(func() []agent.DesiredVM {
+		if !hasQuorum() {
+			return nil // self-fence: minority sheds its workloads
+		}
 		desired := map[string]state.Spec{}
 		for _, sp := range store.Desired() {
 			desired[sp.Name] = sp
@@ -85,7 +101,7 @@ func startPeer(t *testing.T, swimNet, stateNet *cluster.SimNet, snapDir, id stri
 	})
 	go r.Run(ctx)
 
-	sched := market.New(id, capacity, store, sw, clock.RealClock{}, quiet())
+	sched := market.New(id, capacity, store, sw, hasQuorum, clock.RealClock{}, quiet())
 	go sched.Run(ctx, 50*time.Millisecond)
 
 	return &peer{id: id, store: store, swim: sw, fake: fake, cancel: cancel}

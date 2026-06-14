@@ -48,7 +48,7 @@ up() {
       swim_seedflag="--seeds $SWIM_SEED"
       state_seedflag="--state-seeds $STATE_SEED"
     fi
-    "$BIN/murmurd" --fake --node "$id" --capacity 2 \
+    "$BIN/murmurd" --fake --node "$id" --capacity 2 --cluster-size "$n" \
       --gossip-addr "$swim" $swim_seedflag \
       --state-addr "$state" $state_seedflag \
       2>"/tmp/$id.log" &

@@ -170,6 +170,16 @@ but cannot decide. The fixes all reintroduce a sliver of linearizability —
 fencing tokens, a lease backed by *some* single-decision-maker, STONITH — none of
 which a pure CRDT can provide.
 
+**Chosen mechanism:** *quorum-gated self-fencing*. A peer runs a claimed VM only
+while it sees a majority of the FIXED cluster (`--cluster-size`); a partitioned
+minority self-fences (stops its VMs) so the majority can own them safely. No
+leader. This is CAP made concrete — we trade the minority's availability for
+safety. Residual hole we *name, not hide*: a detection-lag window where both
+sides still run briefly, because true instant fencing needs the substrate to
+reject a stale token and our VMM is a black box (directive 1). Demonstrated by
+deterministic SimNet partition tests, toggled by `--fencing` (off → split-brain,
+on → safe).
+
 **You can explain:** split-brain at the *workload* level; why "the dead node might
 not be dead"; why a CRDT register can't be a lock; what a fencing token buys that
 last-write-wins cannot; the precise boundary where you're forced to pay for

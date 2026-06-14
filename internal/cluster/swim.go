@@ -112,6 +112,20 @@ func (s *SWIM) Alive(id string) bool {
 	return ok && st == Alive
 }
 
+// AliveCount returns how many members we currently believe Alive, including
+// ourselves. It reports only what we can *see* — under a partition each side
+// sees a smaller count, which is exactly what lets quorum logic distinguish a
+// majority side from a minority side.
+func (s *SWIM) AliveCount() int {
+	n := 0
+	for _, m := range s.ml.snapshot() {
+		if m.State == Alive {
+			n++
+		}
+	}
+	return n
+}
+
 // Join records seed addresses to bootstrap from. The actual pinging happens
 // inside the Run loop (so all sends stay on the one owning goroutine); the loop
 // re-pings seeds whenever it has no known-alive peers, so a lost join packet

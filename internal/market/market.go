@@ -26,15 +26,19 @@ type Membership interface {
 
 // Scheduler is one peer's market participant.
 type Scheduler struct {
-	self     string
-	capacity int
-	store    *state.Store
-	live     Membership
-	clk      clock.Clock
-	log      *slog.Logger
+	self      string
+	capacity  int
+	store     *state.Store
+	live      Membership
+	hasQuorum func() bool
+	clk       clock.Clock
+	log       *slog.Logger
 }
 
-func New(self string, capacity int, store *state.Store, live Membership, clk clock.Clock, log *slog.Logger) *Scheduler {
+// New builds a scheduler. hasQuorum (may be nil = always) gates claiming: a peer
+// that can't see a majority of the cluster must not grab work, because a
+// partitioned minority claiming is precisely how you end up with two owners.
+func New(self string, capacity int, store *state.Store, live Membership, hasQuorum func() bool, clk clock.Clock, log *slog.Logger) *Scheduler {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -42,7 +46,7 @@ func New(self string, capacity int, store *state.Store, live Membership, clk clo
 		capacity = 1
 	}
 	return &Scheduler{
-		self: self, capacity: capacity, store: store, live: live, clk: clk,
+		self: self, capacity: capacity, store: store, live: live, hasQuorum: hasQuorum, clk: clk,
 		log: log.With("component", "market", "node", self),
 	}
 }
@@ -72,6 +76,12 @@ func (s *Scheduler) liveOwner(c state.Claim) bool {
 func (s *Scheduler) ScheduleOnce() { s.scheduleOnce() }
 
 func (s *Scheduler) scheduleOnce() {
+	// Quorum gate: without a majority we must not claim. A partitioned minority
+	// that kept claiming would run a second live copy of a VM the majority also
+	// runs — split-brain. So the minority simply stops participating.
+	if s.hasQuorum != nil && !s.hasQuorum() {
+		return
+	}
 	desired := s.store.Desired()
 	desiredNames := make(map[string]bool, len(desired))
 	for _, d := range desired {

@@ -43,6 +43,8 @@ func main() {
 		capacity    = flag.Int("capacity", 2, "max VMs this peer will claim")
 		snapEvery   = flag.Duration("snapshot-interval", 5*time.Second, "how often to snapshot owned VMs")
 		gossipEvery = flag.Duration("gossip-interval", 500*time.Millisecond, "state-gossip period")
+		clusterSize = flag.Int("cluster-size", 1, "fixed expected cluster size (for quorum)")
+		fencing     = flag.Bool("fencing", true, "quorum-gate ownership to prevent split-brain")
 	)
 	flag.Parse()
 
@@ -81,10 +83,28 @@ func main() {
 		store = state.New(*node, "", nil, nil, clock.RealClock{}, nil, log)
 	}
 
+	// hasQuorum: can we see a majority of the FIXED cluster? Built after SWIM is
+	// created below; declared here so the reconciler source can close over it.
+	quorum := *clusterSize/2 + 1
+	var sw *cluster.SWIM
+	hasQuorum := func() bool {
+		if !*fencing || sw == nil {
+			return true
+		}
+		return sw.AliveCount() >= quorum
+	}
+
 	// Reconciler: runs exactly the VMs claimed by THIS node, restoring from the
 	// snapshot recorded in the claim when one exists (a re-claim from a dead peer).
 	r := agent.NewReconciler(*node, v, clock.RealClock{}, *interval, log)
 	r.SetSource(func() []agent.DesiredVM {
+		// Self-fence: if we've lost quorum (we're the minority side of a
+		// partition), desire NOTHING — the reconciler will stop everything we run,
+		// so the majority can own it without a second live copy. CAP in action: we
+		// give up availability here to keep safety.
+		if !hasQuorum() {
+			return nil
+		}
 		desired := map[string]state.Spec{}
 		for _, sp := range store.Desired() {
 			desired[sp.Name] = sp
@@ -108,8 +128,7 @@ func main() {
 	go r.Run(ctx)
 
 	// SWIM membership: liveness oracle for the market (a claim is honoured only
-	// while its owner is Alive) and the `nodes` view.
-	var sw *cluster.SWIM
+	// while its owner is Alive), quorum input, and the `nodes` view.
 	if *gossipAddr != "" {
 		tr, err := cluster.NewUDPTransport(*gossipAddr)
 		if err != nil {
@@ -122,7 +141,7 @@ func main() {
 	}
 
 	// Market scheduler: claims unowned/dead-owned desired VMs up to capacity.
-	sched := market.New(*node, *capacity, store, livenessOf(sw, *node), clock.RealClock{}, log)
+	sched := market.New(*node, *capacity, store, livenessOf(sw, *node), hasQuorum, clock.RealClock{}, log)
 	go sched.Run(ctx, *interval)
 
 	// Snapshot loop: periodically snapshot the VMs I own so a survivor can restore
