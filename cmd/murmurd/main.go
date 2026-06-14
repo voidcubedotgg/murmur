@@ -51,17 +51,19 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	var v vmm.VMM
 	if *fake {
-		v = vmm.NewFake()
+		fv := vmm.NewFake()
+		fv.StartWorkload(ctx, time.Second) // simulate a workload accruing state
+		v = fv
 		log.Info("using fake VMM", "node", *node)
 	} else {
 		v = vmm.NewSmolvm(*smolbin)
 		log.Info("using smolvm VMM", "node", *node, "bin", *smolbin)
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	// Replicated desired state (the CRDT store), gossiped peer-to-peer.
 	var store *state.Store
@@ -190,12 +192,19 @@ func psRows(ctx context.Context, node string, store *state.Store, v vmm.VMM) []a
 			observed[o.Name] = o.State
 		}
 	}
+	// Counter is only readable for VMs we own (it lives in our local VMM).
+	counter := func(string) int { return 0 }
+	if c, ok := v.(interface{ Counter(string) int }); ok {
+		counter = c.Counter
+	}
 	claims := store.Claims()
 	var rows []api.PSRow
 	for _, sp := range store.Desired() {
 		owner := claims[sp.Name].Owner
 		o := "-"
+		ctr := 0
 		if owner == node {
+			ctr = counter(sp.Name)
 			if st, ok := observed[sp.Name]; ok {
 				o = string(st)
 			} else {
@@ -205,7 +214,7 @@ func psRows(ctx context.Context, node string, store *state.Store, v vmm.VMM) []a
 		if owner == "" {
 			owner = "(unclaimed)"
 		}
-		rows = append(rows, api.PSRow{Name: sp.Name, Node: owner, Image: sp.Image, Observed: o})
+		rows = append(rows, api.PSRow{Name: sp.Name, Node: owner, Image: sp.Image, Observed: o, Counter: ctr})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
 	return rows

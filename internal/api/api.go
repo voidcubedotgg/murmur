@@ -26,6 +26,7 @@ type PSRow struct {
 	Node     string `json:"node"`
 	Image    string `json:"image,omitempty"`
 	Observed string `json:"observed"` // observed state if on this peer, else "-"
+	Counter  int    `json:"counter"`  // workload state, meaningful only when we own it
 }
 
 // AgentSocketPath is where a murmurd peer listens for murmurctl. One socket per

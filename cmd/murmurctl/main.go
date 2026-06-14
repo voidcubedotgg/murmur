@@ -87,9 +87,9 @@ func cmdPS(c *http.Client) error {
 		return err
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tNODE\tOBSERVED\tIMAGE")
+	fmt.Fprintln(tw, "NAME\tOWNER\tOBSERVED\tCOUNTER\tIMAGE")
 	for _, s := range rows {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", s.Name, s.Node, s.Observed, s.Image)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n", s.Name, s.Node, s.Observed, s.Counter, s.Image)
 	}
 	return tw.Flush()
 }

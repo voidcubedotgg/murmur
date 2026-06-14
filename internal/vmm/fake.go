@@ -18,6 +18,11 @@ type Fake struct {
 	mu    sync.Mutex
 	state map[string]State
 
+	// counters is the workload's accrued state per VM (Stage 5's "in-memory
+	// counter"). A running VM accumulates it; Snapshot persists it and Restore
+	// brings it back, which is how we prove state survives a failover.
+	counters map[string]int
+
 	// snapDir is a SHARED directory where snapshots are written as files, so a
 	// Fake in a *different process* (a survivor peer) can Restore from a snapshot
 	// taken here. Real state would live in the smolvm artifact; this file is the
@@ -30,7 +35,7 @@ func NewFake() *Fake { return NewFakeWithSnapDir(filepath.Join(os.TempDir(), "mu
 
 // NewFakeWithSnapDir lets callers (and tests) pick the shared snapshot dir.
 func NewFakeWithSnapDir(dir string) *Fake {
-	return &Fake{state: make(map[string]State), snapDir: dir}
+	return &Fake{state: make(map[string]State), counters: make(map[string]int), snapDir: dir}
 }
 
 var _ VMM = (*Fake)(nil)
@@ -67,8 +72,9 @@ func (f *Fake) Snapshot(_ context.Context, name string) (SnapshotRef, error) {
 		return "", fmt.Errorf("vmm: snapshot dir: %w", err)
 	}
 	path := filepath.Join(f.snapDir, name+".snap")
-	// Content stands in for VM state; the epoch lets you see snapshots advance.
-	content := fmt.Sprintf("%s@%d", name, time.Now().UnixNano())
+	// The file captures the workload state (counter). A survivor restoring it
+	// resumes that value — proof the snapshot carried real state.
+	content := fmt.Sprintf("%s %d", name, f.counters[name])
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return "", fmt.Errorf("vmm: write snapshot: %w", err)
 	}
@@ -79,12 +85,18 @@ func (f *Fake) Restore(_ context.Context, name string, ref SnapshotRef) error {
 	// Read the shared snapshot file — works even though this Fake never took the
 	// snapshot itself (a different peer/process did). That's the cross-peer state
 	// transfer the failover demo needs.
-	if _, err := os.ReadFile(string(ref)); err != nil {
+	b, err := os.ReadFile(string(ref))
+	if err != nil {
 		return fmt.Errorf("vmm: restore %q from %s: %w", name, ref, err)
 	}
+	var snapName string
+	var counter int
+	// Tolerate a malformed file by restoring as a fresh VM (counter 0).
+	_, _ = fmt.Sscanf(string(b), "%s %d", &snapName, &counter)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.state[name] = Running
+	f.counters[name] = counter
 	return nil
 }
 
@@ -96,6 +108,43 @@ func (f *Fake) List(_ context.Context) ([]Observed, error) {
 		out = append(out, Observed{Name: name, State: st})
 	}
 	return out, nil
+}
+
+// Counter reads a VM's accrued workload state.
+func (f *Fake) Counter(name string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.counters[name]
+}
+
+// WorkloadTick advances the state of every Running VM by one. Tests call this
+// deterministically; the live demo drives it from StartWorkload. It models a
+// real workload accumulating state over time.
+func (f *Fake) WorkloadTick() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for name, st := range f.state {
+		if st == Running {
+			f.counters[name]++
+		}
+	}
+}
+
+// StartWorkload runs WorkloadTick on a timer until ctx is cancelled — the live
+// demo's stand-in for a workload accruing state inside the VM.
+func (f *Fake) StartWorkload(ctx context.Context, interval time.Duration) {
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				f.WorkloadTick()
+			}
+		}
+	}()
 }
 
 // ForceState mutates a VM's observed state directly, bypassing the verbs. This
