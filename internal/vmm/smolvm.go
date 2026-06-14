@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 )
 
 // Smolvm drives real VMs by shelling out to the smolvm binary. smolvm is a
@@ -22,6 +23,12 @@ import (
 type Smolvm struct {
 	// Bin is the smolvm executable; defaults to "smolvm" on PATH.
 	Bin string
+	// SnapDir is where snapshot artifacts are written. For cross-host failover it
+	// MUST be a shared filesystem (e.g. an NFS mount): a survivor on another host
+	// restores by reading the dead owner's artifact, so the artifact has to be
+	// reachable from every peer. Empty = current working directory (single-host
+	// only — a relative artifact name another host can't resolve).
+	SnapDir string
 }
 
 // NewSmolvm returns a Smolvm adapter using the given binary path. Empty bin
@@ -31,6 +38,14 @@ func NewSmolvm(bin string) *Smolvm {
 		bin = "smolvm"
 	}
 	return &Smolvm{Bin: bin}
+}
+
+// NewSmolvmWithSnapDir is NewSmolvm plus a shared snapshot directory, used by the
+// multi-host deploy so re-claims can restore from a peer's snapshot over NFS.
+func NewSmolvmWithSnapDir(bin, snapDir string) *Smolvm {
+	s := NewSmolvm(bin)
+	s.SnapDir = snapDir
+	return s
 }
 
 var _ VMM = (*Smolvm)(nil)
@@ -103,8 +118,14 @@ func (s *Smolvm) Kill(ctx context.Context, name string) error {
 
 func (s *Smolvm) Snapshot(ctx context.Context, name string) (SnapshotRef, error) {
 	// Stage 4 exercises this. pack create --from-vm captures a VM snapshot into
-	// a portable .smolmachine artifact, which Restore consumes.
+	// a portable .smolmachine artifact, which Restore consumes. Writing it under
+	// SnapDir (a shared FS) is what makes the artifact reachable from another
+	// peer for cross-host restore; an absolute path also means the SnapshotRef
+	// gossiped in the claim resolves the same everywhere, not relative to cwd.
 	path := name + ".smolmachine"
+	if s.SnapDir != "" {
+		path = filepath.Join(s.SnapDir, path)
+	}
 	if _, err := s.run(ctx, "pack", "create", "--from-vm", name, "-o", path); err != nil {
 		return "", err
 	}

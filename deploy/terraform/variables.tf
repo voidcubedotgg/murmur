@@ -35,7 +35,8 @@ variable "nfs_server_type" {
 
 variable "image" {
   type        = string
-  default     = "ubuntu-24.04"
+  default     = "debian-12"
+  description = "OS image. Hetzner: debian-12 / debian-13 / ubuntu-24.04. cloud-init + nfs pkgs identical across them."
 }
 
 # Fixed private IPs so cloud-init can template seeds/addresses at provision time.

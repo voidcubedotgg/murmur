@@ -72,8 +72,10 @@ func main() {
 		v = fv
 		log.Info("using fake VMM", "node", *node, "snap-dir", *snapDir)
 	} else {
-		v = vmm.NewSmolvm(*smolbin)
-		log.Info("using smolvm VMM", "node", *node, "bin", *smolbin)
+		// snap-dir, when set, points smolvm at the shared FS so a survivor can
+		// restore a dead peer's snapshot artifact (cross-host failover).
+		v = vmm.NewSmolvmWithSnapDir(*smolbin, *snapDir)
+		log.Info("using smolvm VMM", "node", *node, "bin", *smolbin, "snap-dir", *snapDir)
 	}
 
 	// Replicated desired state (the CRDT store), gossiped peer-to-peer.
