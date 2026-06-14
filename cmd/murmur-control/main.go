@@ -19,15 +19,19 @@ import (
 
 	"github.com/voidcubedotgg/murmur/internal/agent"
 	"github.com/voidcubedotgg/murmur/internal/api"
+	"github.com/voidcubedotgg/murmur/internal/clock"
+	"github.com/voidcubedotgg/murmur/internal/cluster"
 	"github.com/voidcubedotgg/murmur/internal/control"
 )
 
 func main() {
 	var (
-		nodes    = flag.String("nodes", "", "node registry, e.g. host-a=127.0.0.1:7777,host-b=127.0.0.1:7778")
-		sock     = flag.String("socket", api.DefaultControlSocket(), "murmurctl unix socket path")
-		interval = flag.Duration("interval", 3*time.Second, "control reconcile interval")
-		rpcTO    = flag.Duration("rpc-timeout", 2*time.Second, "per-RPC timeout to agents")
+		nodes      = flag.String("nodes", "", "node registry, e.g. host-a=127.0.0.1:7777,host-b=127.0.0.1:7778")
+		sock       = flag.String("socket", api.DefaultControlSocket(), "murmurctl unix socket path")
+		interval   = flag.Duration("interval", 3*time.Second, "control reconcile interval")
+		rpcTO      = flag.Duration("rpc-timeout", 2*time.Second, "per-RPC timeout to agents")
+		gossipAddr = flag.String("gossip-addr", "", "UDP address for SWIM gossip; empty disables membership (all nodes assumed alive)")
+		seeds      = flag.String("seeds", "", "comma-separated seed gossip addresses to join")
 	)
 	flag.Parse()
 
@@ -44,11 +48,28 @@ func main() {
 	}
 	log.Info("node registry", "nodes", registry)
 
-	client := control.NewHTTPAgentClient(*rpcTO)
-	ctrl := control.NewController(registry, client, agent.RealClock{}, *interval, log)
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Membership: the control plane joins the gossip group as a member that
+	// hosts no VMs. Its SWIM view becomes the liveness oracle the controller
+	// uses to stop pushing to dead nodes. With no --gossip-addr we fall back to
+	// AlwaysAlive (Stage-1 behaviour).
+	var live control.Liveness = control.AlwaysAlive{}
+	if *gossipAddr != "" {
+		tr, err := cluster.NewUDPTransport(*gossipAddr)
+		if err != nil {
+			log.Error("gossip transport failed", "err", err)
+			os.Exit(1)
+		}
+		sw := cluster.NewSWIM("control", *gossipAddr, cluster.DefaultConfig(), tr, clock.RealClock{}, nil, log)
+		go sw.Run(ctx)
+		sw.Join(ctx, splitSeeds(*seeds))
+		live = sw
+	}
+
+	client := control.NewHTTPAgentClient(*rpcTO)
+	ctrl := control.NewController(registry, client, agent.RealClock{}, *interval, live, log)
 
 	go ctrl.Run(ctx)
 
@@ -79,6 +100,14 @@ func newServer(ctrl *control.Controller) http.Handler {
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
+	})
+
+	mux.HandleFunc("/nodes", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeJSON(w, ctrl.Members())
 	})
 
 	mux.HandleFunc("/vms/", func(w http.ResponseWriter, req *http.Request) {
@@ -119,6 +148,16 @@ func serve(ctx context.Context, sockPath string, h http.Handler, log *slog.Logge
 		return err
 	}
 	return nil
+}
+
+func splitSeeds(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // parseNodes turns "a=host:port,b=host:port" into a registry map.

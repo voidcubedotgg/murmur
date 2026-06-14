@@ -8,6 +8,7 @@ import (
 
 	"github.com/voidcubedotgg/murmur/internal/agent"
 	"github.com/voidcubedotgg/murmur/internal/api"
+	"github.com/voidcubedotgg/murmur/internal/cluster"
 	"github.com/voidcubedotgg/murmur/internal/vmm"
 )
 
@@ -70,8 +71,14 @@ func (c *fakeClient) List(ctx context.Context, addr string) ([]vmm.Observed, err
 }
 
 func newHarness(client *fakeClient, registry map[string]string) *Controller {
-	return NewController(registry, client, stoppedClock{}, time.Second, nil)
+	return NewController(registry, client, stoppedClock{}, time.Second, AlwaysAlive{}, nil)
 }
+
+// stubLiveness marks a set of nodes dead; everything else is alive.
+type stubLiveness struct{ dead map[string]bool }
+
+func (s stubLiveness) Alive(node string) bool    { return !s.dead[node] }
+func (s stubLiveness) Members() []cluster.Member { return nil }
 
 func observed(t *testing.T, n *fakeNode, name string) vmm.State {
 	t.Helper()
@@ -145,6 +152,30 @@ func TestDoesNotTrustAck(t *testing.T) {
 	ctrl.ReconcileOnce(ctx) // observes gap, re-pushes for real
 	if got := observed(t, b, "counter"); got != vmm.Running {
 		t.Fatalf("want Running after re-push, got %s", got)
+	}
+}
+
+// A node membership reports Dead is skipped: no Apply spam, unlike Stage 1's
+// infinite retry storm.
+func TestSkipsDeadNode(t *testing.T) {
+	ctx := context.Background()
+	b := newFakeNode()
+	client := &fakeClient{nodes: map[string]*fakeNode{"addr-b": b}}
+	ctrl := NewController(
+		map[string]string{"host-b": "addr-b"},
+		client, stoppedClock{}, time.Second,
+		stubLiveness{dead: map[string]bool{"host-b": true}}, nil,
+	)
+	ctrl.Place(api.Assignment{Name: "counter", Node: "host-b"})
+
+	for i := 0; i < 5; i++ {
+		ctrl.ReconcileOnce(ctx)
+	}
+	if client.applyCount != 0 {
+		t.Fatalf("expected zero applies to a dead node, got %d", client.applyCount)
+	}
+	if got := observed(t, b, "counter"); got == vmm.Running {
+		t.Fatal("VM should not be running on a dead node")
 	}
 }
 

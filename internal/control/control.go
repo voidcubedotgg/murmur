@@ -10,8 +10,27 @@ import (
 
 	"github.com/voidcubedotgg/murmur/internal/agent"
 	"github.com/voidcubedotgg/murmur/internal/api"
+	"github.com/voidcubedotgg/murmur/internal/cluster"
 	"github.com/voidcubedotgg/murmur/internal/vmm"
 )
+
+// Liveness is the controller's view of cluster membership. It's an interface so
+// the controller can be tested without a real gossip layer, and so the cluster
+// package stays ignorant of control (the dependency points one way).
+type Liveness interface {
+	// Alive reports whether the node is currently believed up. Remember this is
+	// a belief from SWIM, not ground truth — acting on a false "dead" costs a
+	// needless reschedule, which is why we only *skip* dead nodes here, never do
+	// anything destructive on their behalf.
+	Alive(node string) bool
+	Members() []cluster.Member
+}
+
+// AlwaysAlive is a trivial Liveness for tests / single-node runs: everyone is up.
+type AlwaysAlive struct{}
+
+func (AlwaysAlive) Alive(string) bool         { return true }
+func (AlwaysAlive) Members() []cluster.Member { return nil }
 
 // Controller is the cluster brain. It owns global desired state and converges
 // the cluster toward it by pushing assignments to agents — the same
@@ -26,6 +45,7 @@ type Controller struct {
 	clock    agent.Clock
 	interval time.Duration
 	log      *slog.Logger
+	live     Liveness
 
 	mu       sync.Mutex
 	registry map[string]string         // node id -> address
@@ -34,9 +54,12 @@ type Controller struct {
 }
 
 // NewController builds a controller over a static node registry.
-func NewController(registry map[string]string, client AgentClient, clock agent.Clock, interval time.Duration, log *slog.Logger) *Controller {
+func NewController(registry map[string]string, client AgentClient, clock agent.Clock, interval time.Duration, live Liveness, log *slog.Logger) *Controller {
 	if log == nil {
 		log = slog.Default()
+	}
+	if live == nil {
+		live = AlwaysAlive{}
 	}
 	reg := make(map[string]string, len(registry))
 	for k, v := range registry {
@@ -46,6 +69,7 @@ func NewController(registry map[string]string, client AgentClient, clock agent.C
 		client:   client,
 		clock:    clock,
 		interval: interval,
+		live:     live,
 		log:      log.With("component", "control"),
 		registry: reg,
 		desired:  make(map[string]api.Assignment),
@@ -125,6 +149,9 @@ func (c *Controller) Run(ctx context.Context) {
 	}
 }
 
+// Members exposes the cluster membership view for `murmurctl nodes`.
+func (c *Controller) Members() []cluster.Member { return c.live.Members() }
+
 // reconcileOnce pushes every assignment to its node and verifies by observation.
 func (c *Controller) reconcileOnce(ctx context.Context) {
 	desired, registry, gens := c.snapshot()
@@ -136,6 +163,14 @@ func (c *Controller) reconcileOnce(ctx context.Context) {
 		addr := registry[a.Node]
 		if addr == "" {
 			c.log.Error("assignment references unknown node", "vm", name, "node", a.Node)
+			continue
+		}
+		// Stage 2: stop hammering nodes membership believes are gone. Before
+		// this, a dead node drew an infinite retry storm every tick. We can't
+		// reschedule the VM elsewhere yet (that's Stage 4) — we just stop the
+		// pointless spam and let `ps`/`nodes` tell the truth.
+		if !c.live.Alive(a.Node) {
+			c.log.Warn("skipping apply: node not alive", "vm", name, "node", a.Node)
 			continue
 		}
 		// Don't trust acks: if we can already observe it running on its node,

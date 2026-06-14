@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/voidcubedotgg/murmur/internal/api"
+	"github.com/voidcubedotgg/murmur/internal/cluster"
 )
 
 func main() {
@@ -34,6 +35,8 @@ func run(cmd string, args []string) error {
 		return cmdRun(c, args)
 	case "ps":
 		return cmdPS(c)
+	case "nodes":
+		return cmdNodes(c)
 	case "rm":
 		return cmdRM(c, args)
 	default:
@@ -83,6 +86,28 @@ func cmdPS(c *http.Client) error {
 	return tw.Flush()
 }
 
+func cmdNodes(c *http.Client) error {
+	resp, err := c.Get("http://unix/nodes")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var members []cluster.Member
+	if err := json.NewDecoder(resp.Body).Decode(&members); err != nil {
+		return err
+	}
+	if len(members) == 0 {
+		fmt.Println("(no membership; control started without --gossip-addr)")
+		return nil
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	fmt.Fprintln(tw, "ID\tSTATE\tINCARNATION\tADDR")
+	for _, m := range members {
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\n", m.ID, m.State, m.Incarnation, m.Addr)
+	}
+	return tw.Flush()
+}
+
 func cmdRM(c *http.Client, args []string) error {
 	var name string
 	parseFlags(args, map[string]*string{"--name": &name})
@@ -126,5 +151,6 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   murmurctl run --name NAME --node NODE [--image IMAGE]
   murmurctl ps
+  murmurctl nodes
   murmurctl rm --name NAME`)
 }
