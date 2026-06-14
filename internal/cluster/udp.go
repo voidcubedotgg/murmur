@@ -30,7 +30,9 @@ func (t *UDPTransport) readLoop() {
 	for {
 		n, addr, err := t.conn.ReadFrom(buf)
 		if err != nil {
-			close(t.recv)
+			// Conn closed (shutdown) or fatal read error: just stop reading. We do
+			// NOT close(t.recv) — a closed channel makes consumers' select spin on
+			// zero-value packets. Leaving it open lets them block until ctx cancel.
 			return
 		}
 		b := make([]byte, n)

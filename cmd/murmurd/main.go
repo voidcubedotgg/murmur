@@ -78,6 +78,7 @@ func main() {
 		store = state.New(*node, *stateAddr, splitCSV(*stateSeeds), tr, clock.RealClock{},
 			rand.New(rand.NewSource(time.Now().UnixNano())), log)
 		go store.Run(ctx, *gossipEvery)
+		go func() { <-ctx.Done(); _ = tr.Close() }() // release the socket on shutdown
 	} else {
 		// No gossip configured: a lone in-memory store so single-node runs work.
 		store = state.New(*node, "", nil, nil, clock.RealClock{}, nil, log)
@@ -92,6 +93,22 @@ func main() {
 			return true
 		}
 		return sw.AliveCount() >= quorum
+	}
+
+	// SWIM membership: liveness oracle for the market (a claim is honoured only
+	// while its owner is Alive), quorum input, and the `nodes` view. Built BEFORE
+	// any goroutine that closes over sw (reconciler/market via hasQuorum), so the
+	// assignment of sw happens-before those reads — otherwise it's a data race.
+	if *gossipAddr != "" {
+		tr, err := cluster.NewUDPTransport(*gossipAddr)
+		if err != nil {
+			log.Error("gossip transport failed", "err", err)
+			os.Exit(1)
+		}
+		sw = cluster.NewSWIM(*node, *gossipAddr, cluster.DefaultConfig(), tr, clock.RealClock{}, nil, log)
+		sw.Join(ctx, splitCSV(*seeds))
+		go sw.Run(ctx)
+		go func() { <-ctx.Done(); _ = tr.Close() }() // release the socket on shutdown
 	}
 
 	// Reconciler: runs exactly the VMs claimed by THIS node, restoring from the
@@ -126,19 +143,6 @@ func main() {
 		return out
 	})
 	go r.Run(ctx)
-
-	// SWIM membership: liveness oracle for the market (a claim is honoured only
-	// while its owner is Alive), quorum input, and the `nodes` view.
-	if *gossipAddr != "" {
-		tr, err := cluster.NewUDPTransport(*gossipAddr)
-		if err != nil {
-			log.Error("gossip transport failed", "err", err)
-			os.Exit(1)
-		}
-		sw = cluster.NewSWIM(*node, *gossipAddr, cluster.DefaultConfig(), tr, clock.RealClock{}, nil, log)
-		sw.Join(ctx, splitCSV(*seeds))
-		go sw.Run(ctx)
-	}
 
 	// Market scheduler: claims unowned/dead-owned desired VMs up to capacity.
 	sched := market.New(*node, *capacity, store, livenessOf(sw, *node), hasQuorum, *interval, clock.RealClock{}, log)
@@ -263,7 +267,17 @@ func snapshotLoop(ctx context.Context, node string, every time.Duration, store *
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			for name, c := range store.Claims() {
+			// Sorted iteration: SetClaim advances our Lamport clock, so we keep the
+			// same "behaviour-affecting map iteration is sorted" discipline the
+			// simulator relies on (irrelevant to prod correctness, but consistent).
+			claims := store.Claims()
+			names := make([]string, 0, len(claims))
+			for name := range claims {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				c := claims[name]
 				if c.Owner != node {
 					continue
 				}

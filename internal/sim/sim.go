@@ -15,6 +15,7 @@ import (
 	"io"
 	"log/slog"
 	"math/rand"
+	"sort"
 	"time"
 
 	"github.com/voidcubedotgg/murmur/internal/agent"
@@ -277,7 +278,18 @@ func (s *Sim) snapshotOwned(ctx context.Context) {
 		if n.dead {
 			continue
 		}
-		for name, c := range n.store.Claims() {
+		// Iterate claims in sorted order: SetClaim advances the node's Lamport
+		// clock, so a random map order would consume tick values in a
+		// nondeterministic order — violating the project's "every behaviour-
+		// affecting map iteration is sorted" invariant and making replays fragile.
+		claims := n.store.Claims()
+		names := make([]string, 0, len(claims))
+		for name := range claims {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			c := claims[name]
 			if c.Owner != id {
 				continue
 			}
