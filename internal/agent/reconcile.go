@@ -28,6 +28,10 @@ type Reconciler struct {
 
 	mu      sync.Mutex
 	desired map[string]vmm.Spec
+	// source, if set, is the authoritative desired set each reconcile pass — used
+	// in the CRDT path where desired state lives in the replicated store, not in
+	// this struct. When nil, the locally-set desired map is used (tests).
+	source func() []vmm.Spec
 }
 
 // Status is a desired-vs-observed view of one VM, for `murmurctl ps`.
@@ -54,6 +58,15 @@ func NewReconciler(node string, v vmm.VMM, clock Clock, interval time.Duration, 
 	}
 }
 
+// SetSource installs the authoritative desired-set provider (the replicated
+// CRDT store, filtered to this node). When set, it overrides the local desired
+// map on every reconcile pass.
+func (r *Reconciler) SetSource(src func() []vmm.Spec) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.source = src
+}
+
 // SetDesired declares that we want this VM running. Idempotent.
 func (r *Reconciler) SetDesired(spec vmm.Spec) {
 	r.mu.Lock()
@@ -74,6 +87,16 @@ func (r *Reconciler) RemoveDesired(name string) {
 // snapshotDesired returns a copy of the desired set so the loop never holds the
 // lock while talking to the (possibly slow) substrate.
 func (r *Reconciler) snapshotDesired() map[string]vmm.Spec {
+	r.mu.Lock()
+	src := r.source
+	r.mu.Unlock()
+	if src != nil {
+		out := make(map[string]vmm.Spec)
+		for _, s := range src() {
+			out[s.Name] = s
+		}
+		return out
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	out := make(map[string]vmm.Spec, len(r.desired))

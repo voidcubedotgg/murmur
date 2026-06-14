@@ -1,5 +1,6 @@
-// Command murmurctl is the Stage 1 CLI. It talks to murmur-control over a local
-// unix socket: place a VM on a named node, list VMs (ps), remove a VM.
+// Command murmurctl drives murmur by talking to ANY peer over its unix socket.
+// Writes land in that peer's replicated CRDT store and gossip to the rest; reads
+// return that peer's converged view. Pick the peer with --peer (default host-a).
 package main
 
 import (
@@ -22,14 +23,25 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
-	if err := run(os.Args[1], os.Args[2:]); err != nil {
+	// Optional leading --peer NAME selects which agent socket to dial.
+	peer := "host-a"
+	args := os.Args[1:]
+	if len(args) >= 2 && args[0] == "--peer" {
+		peer = args[1]
+		args = args[2:]
+	}
+	if len(args) == 0 {
+		usage()
+		os.Exit(2)
+	}
+	c := newClient(api.AgentSocketPath(peer))
+	if err := run(c, args[0], args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
-func run(cmd string, args []string) error {
-	c := newClient(api.DefaultControlSocket())
+func run(c *http.Client, cmd string, args []string) error {
 	switch cmd {
 	case "run":
 		return cmdRun(c, args)
@@ -58,9 +70,9 @@ func cmdRun(c *http.Client, args []string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("control: %s", resp.Status)
+		return fmt.Errorf("agent: %s", resp.Status)
 	}
-	fmt.Printf("placed %q on %q\n", name, node)
+	fmt.Printf("recorded %q on %q (gossiping to peers)\n", name, node)
 	return nil
 }
 
@@ -75,13 +87,9 @@ func cmdPS(c *http.Client) error {
 		return err
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tNODE\tDESIRED\tOBSERVED\tIMAGE")
+	fmt.Fprintln(tw, "NAME\tNODE\tOBSERVED\tIMAGE")
 	for _, s := range rows {
-		desired := "no"
-		if s.Desired {
-			desired = "yes"
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", s.Name, s.Node, desired, s.Observed, s.Image)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", s.Name, s.Node, s.Observed, s.Image)
 	}
 	return tw.Flush()
 }
@@ -97,7 +105,7 @@ func cmdNodes(c *http.Client) error {
 		return err
 	}
 	if len(members) == 0 {
-		fmt.Println("(no membership; control started without --gossip-addr)")
+		fmt.Println("(no membership; agent started without --gossip-addr)")
 		return nil
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
@@ -121,13 +129,12 @@ func cmdRM(c *http.Client, args []string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("control: %s", resp.Status)
+		return fmt.Errorf("agent: %s", resp.Status)
 	}
 	fmt.Printf("removed %q\n", name)
 	return nil
 }
 
-// newClient dials the unix socket regardless of URL host.
 func newClient(sockPath string) *http.Client {
 	return &http.Client{
 		Timeout: 5 * time.Second,
@@ -149,8 +156,8 @@ func parseFlags(args []string, into map[string]*string) {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  murmurctl run --name NAME --node NODE [--image IMAGE]
-  murmurctl ps
-  murmurctl nodes
-  murmurctl rm --name NAME`)
+  murmurctl [--peer NAME] run --name NAME --node NODE [--image IMAGE]
+  murmurctl [--peer NAME] ps
+  murmurctl [--peer NAME] nodes
+  murmurctl [--peer NAME] rm --name NAME`)
 }

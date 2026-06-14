@@ -29,13 +29,20 @@ learning.
    system must not care which substrate is underneath.
 
 3. **One distributed-systems concept per stage.** The build follows the ladder in
-   [GOALS.md](./GOALS.md). Don't jump ahead. Don't add consensus before membership
+   [GOALS.md](./GOALS.md). Don't jump ahead. Don't add CRDT state before membership
    works; don't add an overlay network before failover works. Each stage ends with
    a runnable demo.
 
+   > **Path note:** as of Stage 3 murmur follows the **eventually-consistent
+   > (CRDT + gossip, Fly/Corrosion-style) branch, not the consensus/Raft branch.**
+   > There is no leader and no central control plane — agents are peers that
+   > gossip a replicated desired-state CRDT and each runs its own share. The
+   > consensus path is the documented Stage-8 alternative, for contrast.
+
 4. **Implement the hard algorithms by hand the first time.** When a stage
-   introduces Raft, SWIM, a phi-accrual detector, or a CRDT — write it explicitly
-   from the paper, with comments explaining *why*, before reaching for a library.
+   introduces SWIM, CRDTs (Lamport clocks, LWW-Map/OR-Set merge), or the
+   market/claim logic — write it explicitly from first principles, with comments
+   explaining *why*, before reaching for a library.
    The learning is in the implementation. Once it works and is understood, the
    human may choose to swap in a battle-tested library; flag that as a follow-up,
    don't do it preemptively.
@@ -72,7 +79,7 @@ learning.
   (the "actor" shape) over shared mutexes where it keeps reasoning local. Always
   consider: what happens to this goroutine on shutdown? on partition?
 - **Dependencies:** minimal. The point is to build the interesting parts. A gossip
-  or raft library may be introduced *after* a hand-rolled version exists and is
+  or CRDT library may be introduced *after* a hand-rolled version exists and is
   understood (see directive 4).
 - **Tests:** every distributed component gets a test that runs it against the
   `fake` VMM and a simulated network, including a fault-injection case (drop
@@ -81,10 +88,14 @@ learning.
 ## Architecture boundaries you must respect
 
 - `internal/vmm` — the only package that imports substrate-specific code.
-- `internal/cluster` — membership/failure detection. Knows nothing about VMs.
-- `internal/consensus` — leader election + replicated log. Knows nothing about VMs.
-- `internal/control` — uses cluster + consensus to make placement decisions.
-- `internal/agent` — node-local; drives the VMM, runs the local reconcile loop.
+- `internal/cluster` — membership/failure detection (SWIM). Knows nothing about VMs.
+- `internal/crdt` — pure CRDT types (Lamport clock, LWW-Register, LWW-Map).
+  Knows nothing about VMs, gossip, or the network.
+- `internal/state` — replicated desired-state store: holds the CRDT and
+  anti-entropy-gossips it to peers via a `cluster.Transport`. Knows nothing about VMs.
+- `internal/agent` — node-local; drives the VMM, runs the local reconcile loop,
+  and runs this peer's share of the gossiped desired state. There is **no central
+  control plane** — placement/claim decisions are made locally by each peer.
 
 If a change blurs one of these lines, that's a signal to stop and discuss the
 design, not to push through it.
