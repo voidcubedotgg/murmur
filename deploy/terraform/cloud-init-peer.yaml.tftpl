@@ -1,0 +1,32 @@
+#cloud-config
+# A murmur peer. Preps the OS: mounts the shared snapshot store, installs a
+# systemd unit. The binary itself is pushed later by `make deploy` (scp) — until
+# then the service just retries (Restart=always), which is harmless.
+package_update: true
+packages:
+  - nfs-common
+write_files:
+  - path: /etc/systemd/system/murmurd.service
+    content: |
+      [Unit]
+      Description=murmurd ${node}
+      After=network-online.target srv-murmursnap.mount
+      Wants=network-online.target
+      RequiresMountsFor=${snap_dir}
+      [Service]
+      ExecStart=/usr/local/bin/murmurd --fake --snap-dir ${snap_dir} \
+        --node ${node} --cluster-size ${size} --fencing \
+        --gossip-addr ${priv_ip}:8101 --seeds ${seed_ip}:8101 \
+        --state-addr ${priv_ip}:8201 --state-seeds ${seed_ip}:8201 \
+        --capacity 2
+      Restart=always
+      RestartSec=2
+      [Install]
+      WantedBy=multi-user.target
+mounts:
+  - [ "${nfs_ip}:${snap_dir}", "${snap_dir}", "nfs", "defaults,_netdev,nofail", "0", "0" ]
+runcmd:
+  - mkdir -p ${snap_dir}
+  - systemctl daemon-reload
+  - systemctl enable murmurd
+  # Don't start yet: no binary. `make deploy` scps it then starts the service.

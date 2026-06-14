@@ -35,6 +35,7 @@ func main() {
 		node        = flag.String("node", hostname(), "node id (and gossip identity)")
 		interval    = flag.Duration("interval", 2*time.Second, "reconcile interval")
 		smolbin     = flag.String("smolvm", "smolvm", "smolvm binary path")
+		snapDir     = flag.String("snap-dir", "", "shared dir for fake-VMM snapshots (cross-host restore needs this on a shared FS); empty = local default")
 		gossipAddr  = flag.String("gossip-addr", "", "UDP address for SWIM membership gossip")
 		seeds       = flag.String("seeds", "", "comma-separated SWIM seed addresses")
 		stateAddr   = flag.String("state-addr", "", "UDP address for CRDT state gossip")
@@ -58,10 +59,18 @@ func main() {
 
 	var v vmm.VMM
 	if *fake {
-		fv := vmm.NewFake()
+		// A shared snap dir (NFS mount) is what makes cross-host failover restore
+		// real state: the survivor reads the dead owner's snapshot file. Without it
+		// each host snapshots locally and a re-claim boots fresh (state lost).
+		var fv *vmm.Fake
+		if *snapDir != "" {
+			fv = vmm.NewFakeWithSnapDir(*snapDir)
+		} else {
+			fv = vmm.NewFake()
+		}
 		fv.StartWorkload(ctx, time.Second) // simulate a workload accruing state
 		v = fv
-		log.Info("using fake VMM", "node", *node)
+		log.Info("using fake VMM", "node", *node, "snap-dir", *snapDir)
 	} else {
 		v = vmm.NewSmolvm(*smolbin)
 		log.Info("using smolvm VMM", "node", *node, "bin", *smolbin)

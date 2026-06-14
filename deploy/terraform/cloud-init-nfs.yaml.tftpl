@@ -1,0 +1,13 @@
+#cloud-config
+# NFS server: exports the shared snapshot dir to the private subnet only.
+package_update: true
+packages:
+  - nfs-kernel-server
+runcmd:
+  - mkdir -p ${snap_dir}
+  # World-writable: the fake VMM writes snapshot files as a non-root service user.
+  # Fine for a learning cluster on a private network; do not copy to production.
+  - chmod 0777 ${snap_dir}
+  - echo "${snap_dir} ${subnet}(rw,sync,no_subtree_check,no_root_squash)" > /etc/exports
+  - exportfs -ra
+  - systemctl enable --now nfs-server

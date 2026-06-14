@@ -1,0 +1,7 @@
+# Never commit state (may contain secrets), provider plugins, or built binaries.
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
