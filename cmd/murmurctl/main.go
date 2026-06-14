@@ -1,5 +1,5 @@
-// Command murmurctl is the Stage 0 CLI. It talks to murmurd over a local unix
-// socket: run a VM, list VMs (ps), remove a VM.
+// Command murmurctl is the Stage 1 CLI. It talks to murmur-control over a local
+// unix socket: place a VM on a named node, list VMs (ps), remove a VM.
 package main
 
 import (
@@ -13,7 +13,6 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/voidcubedotgg/murmur/internal/agent"
 	"github.com/voidcubedotgg/murmur/internal/api"
 )
 
@@ -29,7 +28,7 @@ func main() {
 }
 
 func run(cmd string, args []string) error {
-	c := newClient(api.DefaultSocketPath())
+	c := newClient(api.DefaultControlSocket())
 	switch cmd {
 	case "run":
 		return cmdRun(c, args)
@@ -44,21 +43,21 @@ func run(cmd string, args []string) error {
 }
 
 func cmdRun(c *http.Client, args []string) error {
-	var name, image string
-	parseFlags(args, map[string]*string{"--name": &name, "--image": &image})
-	if name == "" {
-		return fmt.Errorf("run: --name required")
+	var name, image, node string
+	parseFlags(args, map[string]*string{"--name": &name, "--image": &image, "--node": &node})
+	if name == "" || node == "" {
+		return fmt.Errorf("run: --name and --node required")
 	}
-	body, _ := json.Marshal(api.RunRequest{Name: name, Image: image})
+	body, _ := json.Marshal(api.RunRequest{Name: name, Image: image, Node: node})
 	resp, err := c.Post("http://unix/vms", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("daemon: %s", resp.Status)
+		return fmt.Errorf("control: %s", resp.Status)
 	}
-	fmt.Printf("declared %q desired\n", name)
+	fmt.Printf("placed %q on %q\n", name, node)
 	return nil
 }
 
@@ -68,18 +67,18 @@ func cmdPS(c *http.Client) error {
 		return err
 	}
 	defer resp.Body.Close()
-	var ps []agent.Status
-	if err := json.NewDecoder(resp.Body).Decode(&ps); err != nil {
+	var rows []api.PSRow
+	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
 		return err
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tDESIRED\tOBSERVED\tIMAGE")
-	for _, s := range ps {
+	fmt.Fprintln(tw, "NAME\tNODE\tDESIRED\tOBSERVED\tIMAGE")
+	for _, s := range rows {
 		desired := "no"
 		if s.Desired {
 			desired = "yes"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", s.Name, desired, s.Observed, s.Image)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", s.Name, s.Node, desired, s.Observed, s.Image)
 	}
 	return tw.Flush()
 }
@@ -97,14 +96,13 @@ func cmdRM(c *http.Client, args []string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("daemon: %s", resp.Status)
+		return fmt.Errorf("control: %s", resp.Status)
 	}
-	fmt.Printf("removed %q from desired\n", name)
+	fmt.Printf("removed %q\n", name)
 	return nil
 }
 
-// newClient returns an http.Client that dials the unix socket regardless of the
-// URL host (we use http://unix/... as a placeholder).
+// newClient dials the unix socket regardless of URL host.
 func newClient(sockPath string) *http.Client {
 	return &http.Client{
 		Timeout: 5 * time.Second,
@@ -116,7 +114,6 @@ func newClient(sockPath string) *http.Client {
 	}
 }
 
-// parseFlags is a tiny --key value parser; enough for Stage 0's flat commands.
 func parseFlags(args []string, into map[string]*string) {
 	for i := 0; i+1 < len(args); i += 2 {
 		if dst, ok := into[args[i]]; ok {
@@ -127,7 +124,7 @@ func parseFlags(args []string, into map[string]*string) {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  murmurctl run --name NAME [--image IMAGE]
+  murmurctl run --name NAME --node NODE [--image IMAGE]
   murmurctl ps
   murmurctl rm --name NAME`)
 }
